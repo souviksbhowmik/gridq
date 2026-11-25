@@ -111,9 +111,31 @@ CVaR(α = 0.25) gives about 40–50% more enrichment than the plain expectation 
 | 2 | 2.80× | 2.15× | 60 → 105 |
 | 3 | 2.97× | 2.23× | 90 → 167 |
 
-Routing onto the heavy-hex topology adds SWAPs and roughly doubles the 2-qubit gate count. **Under noise, gains beyond p = 2 almost disappear.** Deeper circuits add as much error as they remove. Real-hardware results go in `results/hardware_*.json` (see §6).
+Routing onto the heavy-hex topology adds SWAPs and roughly doubles the 2-qubit gate count. **Under noise, gains beyond p = 2 almost disappear.** Deeper circuits add as much error as they remove.
 
-### 4.5 Deployment day (`results/deployment_day_summary.csv`)
+### 4.5 Real IBM Quantum hardware: `ibm_fez` (Heron r2), n = 6, p = 2
+
+The same trained circuit, the same instance (seed 0) and 4,096 shots per run. Run on 25 Nov 2026. The raw counts and job IDs are in [`results/hardware_ibm_fez_n6_p2_s0.json`](results/hardware_ibm_fez_n6_p2_s0.json).
+
+| Run | P(optimal) ± 1σ | Enrichment vs random | ⟨H⟩ | Fidelity to ideal distribution | Optimal dispatch found? |
+|---|---|---|---|---|---|
+| Ideal (exact simulation) | 0.045 ± 0.003 | 2.86× | 2.10 | 1.000 | ✔ |
+| FakeFez noise model | 0.037 ± 0.003 | 2.38× | 2.71 | 0.956 | ✔ |
+| **ibm_fez, unmitigated** (`dc3906dhdvas73bndf2g`) | **0.042 ± 0.003** | **2.70×** | 2.70 | 0.937 | ✔ |
+| ibm_fez, mitigated: DD + gate/measure twirling (`dc3907inj2vs73dhsdl0`) | 0.029 ± 0.003 | 1.88× | 3.26 | 0.906 | ✔ |
+| Uniform random guessing | 0.016 | 1.00× | 5.35 | 0.733 | n/a |
+
+Transpiled for `ibm_fez`: 105 two-qubit gates, two-qubit depth 77, total depth 250.
+
+**Findings**
+- **Real hardware keeps most of the quantum signal.** Unmitigated `ibm_fez` reaches 2.70× enrichment, which is 94% of the ideal 2.86×. Its energy matches the noise model almost exactly (⟨H⟩ 2.70 vs 2.71). The `FakeFez` snapshot predicted the device's degradation well, and if anything it was slightly pessimistic about P(optimal).
+- **Every run returned the optimal dispatch.** That is ₹69.7 for 11.9 kW against an 11.6 kW deficit, with 100% of demand met and no line overloads.
+- **The "mitigated" run was worse, and the gap is statistically significant** (z = 3.2). Dynamical decoupling and twirling *suppress* coherent errors but do not *correct* sampled distributions. Twirling turns coherent errors into incoherent (depolarising-like) noise, which flattens the output distribution towards uniform. For a sampling algorithm like QAOA, where the useful signal is a skewed distribution, that hurts. These options pay off mainly for **expectation values** with an Estimator (for example ZNE, PEC or TREX).
+
+  Our lesson: *benchmark mitigation, don't assume it.* Next steps would be DD-only without twirling, and readout-error mitigation on the counts (for example M3).
+- **Honest caveat:** this is one instance and one run per setting, at n = 6. At this size, random sampling with the same shot budget also finds the optimum after repair (§5).
+
+### 4.6 Deployment day (`results/deployment_day_summary.csv`)
 
 We dispatched one 8-asset village hour by hour over a synthetic 24-hour demand, solar and wind profile.
 
@@ -130,7 +152,7 @@ QAOA matched the exact optimum in every hour. Most of the economic value comes f
 
 - **Classical wins at this size.** For ≤ 12 assets, brute force is exact in under 1 ms. We make **no quantum-advantage claim**.
 - **QAOA's signal is real but not yet decisive.** It concentrates probability on the optimum (2–7× over random, rising with p). But with 256 shots and the same repair step, **random sampling also finds the optimum** at n ≤ 12, because the search space is so small.
-- **Noise caps useful depth at p ≈ 2** on today's devices for this problem.
+- **Noise caps useful depth at p ≈ 2** on today's devices for this problem. On real `ibm_fez` the unmitigated run kept 94% of the ideal enrichment; the twirling-based mitigation we tried made it worse (§4.5).
 - **Formulation gap.** The squared balance penalty plus repair can land up to 14% (mean 2.5%) of the feasible objective range away from the true optimum. Across 45 calibration instances it was exact 62% of the time (`tests/test_gridq.py`). Slack-variable encodings cost extra qubits. We tested them and they improved this only moderately.
 - **Single interval.** We do not model battery state of charge across hours or AC power flow. Lines use a simple pairwise capacity model.
 - **Synthetic data only**, as the rules require.
