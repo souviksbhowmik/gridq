@@ -1,0 +1,4 @@
+solver,cost_inr,naive_cost_inr,line_overload_hours,saved_pct
+exact,1135.9,4047.9,0,71.9
+greedy_operator,1084.7,4047.9,0,73.2
+qaoa_p3,1135.9,4047.9,0,71.9

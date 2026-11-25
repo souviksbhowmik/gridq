@@ -1,0 +1,11 @@
+{
+  "seconds": {
+    "correctness": 12.8,
+    "depth": 12.6,
+    "density": 44.6,
+    "scaling": 24.9,
+    "noise": 139.8,
+    "day": 5.8
+  },
+  "quick": false
+}
