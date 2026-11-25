@@ -10,7 +10,7 @@ Experiments
   density      QAOA convergence + quality + transpiled 2q depth vs graph density
   scaling      runtime and quality vs n = 6..12, all solvers
   noise        ideal vs fake-Heron noise model, p = 1..3
-  day          24-h deployment simulation: % demand met and cost vs naive diesel-first
+  day          24-h dispatch of data/villages/village_n8_s0 (per-site demand - solar - wind)
 """
 
 from __future__ import annotations
@@ -216,25 +216,29 @@ def exp_noise(seeds, max_p=3):
     return df
 
 
-def exp_day(n=8, seed=0):
-    """Hour-by-hour dispatch of one village for a synthetic day."""
-    prof = daily_profile(seed=seed)
-    base = make_microgrid(n, 0.4, seed=seed)
+def exp_day(village="village_n8_s0"):
+    """Hour-by-hour dispatch of one village for a day, from its master-data files.
+
+    Deficit per hour = sum of site demand - solar - wind (data/villages/<village>/).
+    """
+    from gridq.data import load_village
+
+    v = load_village(Path(__file__).resolve().parents[1] / "data" / "villages" / village)
+    bal = v.hourly_balance().set_index("hour")
     rows = []
-    for h, dem, sol, wnd in zip(prof["hour"], prof["demand"], prof["solar"], prof["wind"]):
-        deficit = round(float(dem - sol - wnd), 1)
-        if deficit <= 0.5 or deficit > base.power.sum():
-            rows.append(dict(hour=h, deficit_kw=max(deficit, 0), solver="none_needed", cost_inr=0.0,
-                             naive_cost_inr=0.0, demand_met_pct=100.0, overloaded_lines=0))
+    for h, r in bal.iterrows():
+        if not (r.dispatch_needed and r.coverable):
+            rows.append(dict(hour=h, deficit_kw=max(float(r.net_deficit_kw), 0.0), solver="none_needed",
+                             cost_inr=0.0, naive_cost_inr=0.0, demand_met_pct=100.0, overloaded_lines=0))
             continue
-        base.deficit = deficit
-        q = build_qubo(base)
+        g = v.microgrid(int(h))
+        q = build_qubo(g)
         for name, x in (("qaoa_p3", solve_qaoa(q, reps=3, shots=256).repaired_x), ("greedy_operator", greedy_operator(q).x),
                         ("exact", constrained_optimum(q).x)):
-            x = repair(base, x)
-            m = dispatch_metrics(base, x)
-            rows.append(dict(hour=h, deficit_kw=deficit, solver=name, cost_inr=m["cost_inr"],
-                             naive_cost_inr=naive_policy_cost(base), demand_met_pct=m["demand_met_pct"],
+            x = repair(g, x)
+            m = dispatch_metrics(g, x)
+            rows.append(dict(hour=h, deficit_kw=g.deficit, solver=name, cost_inr=m["cost_inr"],
+                             naive_cost_inr=naive_policy_cost(g), demand_met_pct=m["demand_met_pct"],
                              overloaded_lines=m["overloaded_lines"]))
     df = pd.DataFrame(rows)
     df.to_csv(OUT / "deployment_day.csv", index=False)
@@ -242,6 +246,7 @@ def exp_day(n=8, seed=0):
     tot = tot.rename(columns={"overloaded_lines": "line_overload_hours"})
     tot["saved_pct"] = (100 * (1 - tot.cost_inr / tot.naive_cost_inr)).round(1)
     tot.to_csv(OUT / "deployment_day_summary.csv")
+    print(f"village: {village}")
     print(tot.to_string())
     return df
 

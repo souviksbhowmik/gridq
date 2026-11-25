@@ -107,3 +107,38 @@ def test_qaoa_beats_uniform_sampling():
     uniform_mean = energy_landscape(q).mean()
     assert r.expected_energy < uniform_mean
     assert r.best_energy >= brute_force(q).energy - 1e-9
+
+
+def test_village_master_data_round_trip(tmp_path):
+    from gridq.data import load_village, make_village
+
+    v = make_village(8, 0.4, seed=0)
+    w = load_village(v.save(tmp_path / "v"))
+    assert w.n == 8 and len(w.demand) == 24
+    assert np.allclose(v.hourly_balance().net_deficit_kw, w.hourly_balance().net_deficit_kw)
+
+
+def test_village_deficit_is_demand_minus_renewables():
+    from gridq.data import make_village
+
+    v = make_village(8, 0.4, seed=1)
+    b = v.hourly_balance()
+    assert np.allclose(b.net_deficit_kw, (b.demand_kw - b.solar_kw - b.wind_kw).round(2), atol=0.02)
+    assert b.coverable.all()  # sized so every hour can be covered
+    peak = int(b.loc[b.net_deficit_kw.idxmax(), "hour"])
+    assert 17 <= peak <= 21  # evening peak
+    g = v.microgrid(peak)
+    assert g.n == 8 and np.isclose(g.deficit, round(b.net_deficit_kw.max(), 1))
+
+
+def test_shipped_village_files_load():
+    from pathlib import Path
+
+    from gridq.data import load_village
+
+    root = Path(__file__).resolve().parents[1] / "data" / "villages"
+    folders = [p for p in root.iterdir() if (p / "sites.csv").exists()]
+    assert folders
+    for f in folders:
+        v = load_village(f)
+        assert v.hourly_balance().coverable.all()

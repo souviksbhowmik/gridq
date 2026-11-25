@@ -1,0 +1,13 @@
+site_id,site_name,site_type,critical,peak_demand_kw,asset,asset_kw,price_inr_per_kwh
+0,Water Pump 0,water_pump,True,4.65,battery,4.8,6.792
+1,Clinic 1,clinic,True,3.58,demand_response,1.9,13.895
+2,Household 2,household,False,2.62,battery,4.3,4.047
+3,Household 3,household,False,2.04,battery,3.5,6.6
+4,Cold Store 4,cold_store,True,2.79,diesel,6.1,29.852
+5,Household 5,household,False,2.99,demand_response,2.6,13.846
+6,School 6,school,False,3.53,battery,3.2,4.437
+7,Household 7,household,False,2.39,demand_response,2.5,13.88
+8,Household 8,household,False,2.94,diesel,6.8,29.118
+9,Water Pump 9,water_pump,True,3.89,battery,4.8,6.458
+10,Household 10,household,False,2.17,diesel,4.5,25.844
+11,School 11,school,False,4.71,demand_response,2.5,10.92

@@ -23,7 +23,23 @@
 | Decision | For one dispatch interval: which of the *n* flexible assets (6–12) to switch on |
 | Constraints | Supply ≥ deficit; shared feeder lines have a thermal capacity |
 | Objective | Minimise running cost (₹), prefer supplying critical loads (clinic, water pump, cold store) |
-| Data | **100% synthetic** (`src/gridq/data.py`, seeded). No real customer or utility data |
+| Data | **100% synthetic** village master data in [`data/villages/`](data/villages/) (see §1.1). No real customer or utility data |
+
+### 1.1 Village master data (`data/villages/<village>/`)
+
+Every village is a folder of plain CSV files that you can open in Excel or edit by hand:
+
+| File | Contents |
+|---|---|
+| `sites.csv` | One row per site: `site_name`, `site_type` (household / school / clinic / water pump / cold store), `critical`, `peak_demand_kw`, and its **flexible asset** (`asset` = battery / diesel / demand_response, `asset_kw`, `price_inr_per_kwh`) |
+| `lines.csv` | Distribution lines between sites and their `capacity_kw` |
+| `site_demand.csv` | Hourly demand of **each site** (24 rows), built from a load shape per site type: households peak in the evening, the school by day, the clinic around the clock, and so on |
+| `renewables.csv` | Hourly village solar and wind output (kW) |
+| `village.json` | Name, seed and notes |
+
+For each hour: **village deficit = Σ site demand − solar − wind**. That deficit is what the flexible assets must cover. Shipped villages: `village_n6_s0`, `village_n8_s0` (the demo), `village_n8_s1`, `village_n10_s0` and `village_n12_s0`. Regenerate them with `python scripts/export_villages.py`, or edit the CSVs to use your own figures. The dashboard reads whatever is in the folder.
+
+The benchmark experiments (§4.1–4.4) use many randomly generated instances (`make_microgrid(n, density, seed)`) with the same assets. In those, the deficit is set to 45% of total flexible capacity, so every instance is equally hard.
 
 ## 2. QUBO formulation (`src/gridq/qubo.py`)
 
@@ -137,16 +153,16 @@ Transpiled for `ibm_fez`: 105 two-qubit gates, two-qubit depth 77, total depth 2
 
 ### 4.6 Deployment day (`results/deployment_day_summary.csv`)
 
-We dispatched one 8-asset village hour by hour over a synthetic 24-hour demand, solar and wind profile.
+We dispatched the village in [`data/villages/village_n8_s0/`](data/villages/village_n8_s0/) hour by hour for 24 hours. Each hour's deficit = Σ site demand − solar − wind, taken from the master-data files. Renewables cover 09:00–16:00, and the other 15 hours need dispatch, peaking at 17.6 kW at 19:00.
 
 | Policy | Daily cost | Saved vs diesel-first | Line-overload hours |
 |---|---|---|---|
-| Diesel-first (status quo) | ₹4,048 | n/a | n/a |
-| Operator rule | ₹1,085 | 73.2% | 0 |
-| **QAOA p = 3** | **₹1,136** | **71.9%** | **0** |
-| Exact optimum | ₹1,136 | 71.9% | 0 |
+| Diesel-first (status quo) | ₹4,898 | n/a | n/a |
+| Operator rule | ₹2,193 | 55.2% | 0 |
+| **QAOA p = 3** | **₹2,036** | **58.4%** | **0** |
+| Exact optimum | ₹2,036 | 58.4% | 0 |
 
-QAOA matched the exact optimum in every hour. Most of the economic value comes from **optimising at all**, rather than running diesel by default. The optimiser pays a little more than the operator rule because it keeps critical loads (the clinic) supplied by their own assets.
+QAOA matched the exact optimum in every hour. It beats the operator's cheapest-first rule by about ₹157 a day (7%). Most of the value comes from **optimising at all**, rather than running diesel by default.
 
 ## 5. Honest assessment and limitations
 
@@ -154,12 +170,13 @@ QAOA matched the exact optimum in every hour. Most of the economic value comes f
 - **QAOA's signal is real but not yet decisive.** It concentrates probability on the optimum (2–7× over random, rising with p). But with 256 shots and the same repair step, **random sampling also finds the optimum** at n ≤ 12, because the search space is so small.
 - **Noise caps useful depth at p ≈ 2** on today's devices for this problem. On real `ibm_fez` the unmitigated run kept 94% of the ideal enrichment; the twirling-based mitigation we tried made it worse (§4.5).
 - **Formulation gap.** The squared balance penalty plus repair can land up to 14% (mean 2.5%) of the feasible objective range away from the true optimum. Across 45 calibration instances it was exact 62% of the time (`tests/test_gridq.py`). Slack-variable encodings cost extra qubits. We tested them and they improved this only moderately.
-- **Single interval.** We do not model battery state of charge across hours or AC power flow. Lines use a simple pairwise capacity model.
+- **Hour by hour, not linked.** Each hour is optimised on its own. We do not carry battery state of charge from one hour to the next, or model AC power flow. Lines use a simple pairwise capacity model.
+- **Village-level balance.** Per-site demand is in the data and sums to the village deficit, but power is pooled on the shared grid. Critical sites get a priority bonus, not a guaranteed per-site supply.
 - **Synthetic data only**, as the rules require.
 
 **When could quantum matter?** District-scale grids (hundreds of assets with multi-period coupling) are beyond brute force, and heuristics there degrade. Getting there needs sparser formulations (lower circuit depth), better error mitigation, and eventually fault-tolerant hardware.
 
-**Path to deployment.** The value delivered today is an *optimiser-in-the-loop* dispatch for community microgrid operators, saving about 70% vs diesel-first in our synthetic day. The solver backend is pluggable: classical today, quantum as hardware matures.
+**Path to deployment.** The value delivered today is an *optimiser-in-the-loop* dispatch for community microgrid operators, saving about 58% vs diesel-first (and 7% vs the operator's rule of thumb) over our synthetic day. The solver backend is pluggable: classical today, quantum as hardware matures.
 
 ## 6. How to run
 
@@ -176,7 +193,7 @@ python -m ipykernel install --user --name qff-gridq --display-name "Python (qff-
 ### 6.2 Run everything on simulators (no account needed)
 
 ```bash
-pytest -q                                   # 24 tests, ~2 s
+pytest -q                                   # 27 tests, ~2 s
 python experiments/run_benchmarks.py        # all 6 experiments → results/  (~4 min)
 python experiments/run_benchmarks.py --quick              # smoke test, 3 seeds
 python experiments/run_benchmarks.py --only density noise # selected experiments
@@ -187,7 +204,7 @@ python experiments/run_benchmarks.py --only density noise # selected experiments
 | Format | Command | Notes |
 |---|---|---|
 | Jupyter notebook | `jupyter notebook notebooks/demo.ipynb` | Choose kernel **Python (qff-gridq)**; *Run All* takes about 1 min |
-| Streamlit dashboard | `streamlit run app/streamlit_app.py` | Opens http://localhost:8501. Pick nodes, density, p, shots, and ideal vs noisy backend, then click **Solve dispatch** |
+| Streamlit dashboard | `streamlit run app/streamlit_app.py` | Opens http://localhost:8501. Pick a village and an hour in the sidebar. Four tabs: **📋 Village master data** (sites, assets, lines) · **⚡ Demand & supply** (per-site demand, solar, wind, hourly deficit) · **🧮 Dispatch (one hour)** (QAOA vs classical; choose p, shots, ideal or noisy backend) · **📅 24-hour plan** (day cost vs diesel-first) |
 
 ### 6.4 Real IBM Quantum hardware (optional; uses credits)
 
@@ -230,7 +247,9 @@ Results are saved to `results/hardware_<backend>_n<n>_p<reps>_s<seed>.json`. Eac
 ## 7. Repository layout
 
 ```
-src/gridq/        data.py · qubo.py · classical.py · qaoa.py · metrics.py · hardware.py
+src/gridq/        data.py (generator + Village master data) · qubo.py · classical.py · qaoa.py · metrics.py · hardware.py
+data/villages/    village master data (CSV): sites, lines, per-site demand, renewables
+scripts/          export_villages.py (regenerates data/villages)
 experiments/      run_benchmarks.py (6 experiments) · run_hardware.py
 .env.example      template for IBM credentials (copy to .env)
 notebooks/        demo.ipynb
