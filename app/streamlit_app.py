@@ -34,11 +34,11 @@ from gridq.metrics import naive_policy_cost
 from gridq.qubo import all_bitstrings, dispatch_objective
 
 try:  # run as `streamlit run app/streamlit_app.py`
-    from qaoa_worker import (hardware_backend_isolated, score_saved_run_isolated, solve_hardware_isolated,
-                             solve_qaoa_isolated)
+    from qaoa_worker import (draw_circuit_isolated, hardware_backend_isolated, score_saved_run_isolated,
+                             solve_hardware_isolated, solve_qaoa_isolated)
 except ImportError:  # imported as a module (tests)
-    from app.qaoa_worker import (hardware_backend_isolated, score_saved_run_isolated, solve_hardware_isolated,
-                                 solve_qaoa_isolated)
+    from app.qaoa_worker import (draw_circuit_isolated, hardware_backend_isolated, score_saved_run_isolated,
+                                 solve_hardware_isolated, solve_qaoa_isolated)
 
 RESULTS = Path(__file__).resolve().parents[1] / "results"
 BACKENDS = ["Ideal simulator", "Noisy simulator (IBM Heron snapshot)"]
@@ -56,6 +56,35 @@ def has_ibm_credentials() -> bool:
 @st.cache_data(show_spinner=False)
 def scored_hardware_run(path: str, mtime: float) -> dict:
     return score_saved_run_isolated(path)
+
+
+@st.cache_data(show_spinner=False)
+def circuit_png(n: int, power: tuple, cost: tuple, deficit: float, params: tuple) -> dict:
+    """Draw a trained QAOA circuit once (in the worker) and cache the PNG."""
+    import hashlib
+    import tempfile
+
+    from gridq.data import Microgrid
+
+    key = hashlib.md5(repr((n, power, cost, deficit, params)).encode()).hexdigest()[:12]
+    png = Path(tempfile.gettempdir()) / f"gridq_circuit_{key}.png"
+    g = Microgrid(n=n, power=np.array(power), cost=np.array(cost), deficit=deficit)
+    return draw_circuit_isolated(g, params, str(png))
+
+
+def show_circuit(g, params, caption: str):
+    with st.spinner("Drawing the quantum circuit ..."):
+        c = circuit_png(g.n, tuple(g.power.tolist()), tuple(g.cost.tolist()), float(g.deficit),
+                        tuple(float(p) for p in params))
+    if not c["ok"]:
+        st.error(f"Could not draw the circuit: {c['error']}")
+        return
+    st.markdown(f"**{g.n} qubits** (qubit *i* = provider *i*) · **p = {c['reps']}** layers · "
+                f"**{c['rzz']} ZZ** two-qubit gates · {c['rz']} RZ · {c['rx']} RX · depth {c['depth']}")
+    st.image(c["png"], width="stretch")
+    st.caption(caption + " **H**: equal superposition of all dispatches · **RZ**: each provider's cost and kW · "
+               "**ZZ**: balance coupling between every pair of providers (together they must cover the shortfall) · "
+               "**RX**: mixer · then measure: one dispatch per shot.")
 
 warnings.filterwarnings("ignore")
 st.set_page_config(page_title="GridQ: quantum microgrid dispatch", layout="wide")
@@ -107,7 +136,8 @@ def run_solver(name, grid, qubo, reps, shots, backend):
         if not r["ok"]:
             raise RuntimeError(r["error"])
         x = np.array(r["x"], dtype=np.int8)
-        extra = {k: r[k] for k in ("enrichment", "p_optimal", "evals", "two_q_depth", "two_q_gates", "counts")}
+        extra = {k: r[k] for k in ("enrichment", "p_optimal", "evals", "two_q_depth", "two_q_gates", "counts",
+                                   "params")}
         extra.update(qubits=grid.n, shots=shots)
     elif name == "Exact (brute force)":
         x = constrained_optimum(qubo).x
@@ -347,6 +377,8 @@ with tab_solve:
         # ---- quantum details
         if "QAOA (quantum)" in results:
             q = results["QAOA (quantum)"]
+            with st.expander("Quantum circuit used by QAOA (trained angles)", expanded=False):
+                show_circuit(grid, q["params"], "The trained QAOA circuit, gate by gate.")
             with st.expander("Quantum details: QAOA output distribution and circuit", expanded=False):
                 k1, k2, k3, k4 = st.columns(4)
                 k1.metric("Backend", "noisy sim" if cmp["backend"].startswith("Noisy") else "ideal sim")
@@ -638,6 +670,15 @@ with tab_hw:
                "optimal dispatch found", "IBM job id"]]
             st.dataframe(table, hide_index=True, width="stretch")
 
+            with st.expander(f"Quantum circuit sent to {hw['backend']} (trained angles, before compiling)",
+                             expanded=False):
+                from gridq.data import Microgrid
+
+                show_circuit(Microgrid(n=hw["n"], power=np.array(hw["power"]), cost=np.array(hw["cost"]),
+                                       deficit=hw["deficit_kw"]), hw["params"],
+                             f"Exactly the circuit that ran on {hw['backend']}. On the chip it was compiled to native "
+                             f"gates: {hw['circuit']['two_qubit_gates']} CZ gates, two-qubit depth "
+                             f"{hw['circuit']['two_qubit_depth']} (extra SWAPs for the chip's wiring).")
             st.markdown("**Output distributions** (bar = share of shots; green = the optimal on/off combination)")
             probs = hw["probs"]
             show = [k for k in probs if not k.startswith("Random")]

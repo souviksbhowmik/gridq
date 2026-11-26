@@ -252,3 +252,55 @@ def depth_sweep(qubo: Qubo, max_reps: int = 4, **kw) -> list[QAOAResult]:
         results.append(r)
         init = interp_init(r.params)
     return results
+
+
+def readable_circuit(qubo: Qubo, params: np.ndarray | None = None, reps: int = 1, digits: int = 2) -> QuantumCircuit:
+    """The QAOA circuit written gate by gate, for drawing and explaining.
+
+    Same unitary as QAOAAnsatz (verified in tests), but built explicitly:
+      H on every qubit             -> equal superposition of all 2^n dispatches
+      per layer:  RZ(2*gamma*h_i)  -> cost of switching provider i on
+                  RZZ(2*gamma*J_ij)-> balance coupling between providers i and j
+                  RX(2*beta)       -> mixer: lets probability move between dispatches
+      measure                      -> one dispatch per shot
+    With `params` (order [betas..., gammas...]) the angles are numbers rounded
+    to `digits`; without, they are symbols gamma_k / beta_k.
+    """
+    from qiskit.circuit import Parameter
+
+    op, _, _ = qubo.to_ising(normalise=True)
+    n = qubo.n
+    fields, couplings = {}, {}
+    for label, coeff in zip(op.paulis.to_labels(), np.real(op.coeffs)):
+        zs = [n - 1 - k for k, ch in enumerate(label) if ch == "Z"]
+        if len(zs) == 1:
+            fields[zs[0]] = coeff
+        elif len(zs) == 2:
+            couplings[tuple(sorted(zs))] = coeff
+    if params is not None:
+        reps = len(params) // 2
+        betas, gammas = params[:reps], params[reps:]
+    else:
+        betas = [Parameter(f"β{k}") for k in range(reps)]
+        gammas = [Parameter(f"γ{k}") for k in range(reps)]
+
+    def ang(scale, theta):
+        """Angle = scale * theta; numbers are rounded, symbols get a rounded coefficient."""
+        if params is not None:
+            return round(float(scale * theta), digits)
+        return round(float(scale), digits) * theta
+
+    qc = QuantumCircuit(n, name="QAOA")
+    qc.h(range(n))
+    for k in range(reps):
+        qc.barrier(label=f"cost layer {k + 1}")
+        for i in range(n):
+            if i in fields:
+                qc.rz(ang(2 * fields[i], gammas[k]), i)
+        for (i, j), J in sorted(couplings.items()):
+            qc.rzz(ang(2 * J, gammas[k]), i, j)
+        qc.barrier(label=f"mixer {k + 1}")
+        for i in range(n):
+            qc.rx(ang(2, betas[k]), i)
+    qc.measure_all()
+    return qc

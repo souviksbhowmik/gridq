@@ -37,7 +37,7 @@ def _task_qaoa(n, power, cost, deficit, reps, shots, noisy):
         sampler, pm = noisy_sampler(fb, seed=0), backend_pass_manager(fb)
     r = solve_qaoa(qubo, reps=reps, shots=shots, sampler=sampler, pass_manager=pm)
     return {"x": r.repaired_x.tolist(), "enrichment": r.enrichment, "p_optimal": r.p_optimal,
-            "evals": r.n_evals, "two_q_depth": r.circuit_stats["two_qubit_depth"],
+            "params": r.params.tolist(), "evals": r.n_evals, "two_q_depth": r.circuit_stats["two_qubit_depth"],
             "two_q_gates": r.circuit_stats["two_qubit_gates"], "counts": r.counts}
 
 
@@ -48,6 +48,25 @@ def _task_hardware(n, power, cost, deficit, reps, shots, mitigate):
     r = run_qaoa_on_hardware(_grid(n, power, cost, deficit), reps=reps, shots=shots, mitigate=mitigate)
     r.pop("params", None)
     return r
+
+
+def _task_circuit(n, power, cost, deficit, params, png_path):
+    """Draw the trained QAOA circuit (gate by gate) to a PNG; return gate counts."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from gridq import build_qubo
+    from gridq.qaoa import readable_circuit
+
+    circ = readable_circuit(build_qubo(_grid(n, power, cost, deficit)), np.asarray(params))
+    fig = circ.draw("mpl", fold=30, scale=0.6)
+    fig.savefig(png_path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    ops = circ.count_ops()
+    return {"png": png_path, "rzz": ops.get("rzz", 0), "rz": ops.get("rz", 0), "rx": ops.get("rx", 0),
+            "depth": circ.depth(), "reps": len(params) // 2}
 
 
 def _task_score(path):
@@ -65,7 +84,8 @@ def _task_backend():
             "operational": getattr(status, "operational", None)}
 
 
-TASKS = {"qaoa": _task_qaoa, "hardware": _task_hardware, "score": _task_score, "backend": _task_backend}
+TASKS = {"qaoa": _task_qaoa, "hardware": _task_hardware, "score": _task_score, "backend": _task_backend,
+         "circuit": _task_circuit}
 
 
 def run_isolated(task: str, *args, timeout: float = 300.0) -> dict:
@@ -146,3 +166,7 @@ if __name__ == "__main__":
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     _main()
+
+
+def draw_circuit_isolated(grid, params, png_path: str) -> dict:
+    return run_isolated("circuit", *_grid_args(grid), list(map(float, params)), str(png_path), timeout=180.0)

@@ -6,11 +6,12 @@ nbformat==5.11.1
 networkx==3.7
 numpy==2.5.5
 pandas==3.1.1
+pylatexenc==2.11
 pytest==9.2.0
 python-dotenv==1.2.4
-qiskit==2.6.2
 qiskit-aer==0.18.4
 qiskit-ibm-runtime==0.52.1
 qiskit-optimization==0.7.0
+qiskit==2.6.2
 scipy==1.18.1
 streamlit==1.67.0

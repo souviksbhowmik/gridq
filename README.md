@@ -56,6 +56,17 @@ This is a **minimum-cost covering (knapsack-type) problem**. Expanding the squar
 
 The QUBO is built as a `qiskit_optimization.QuadraticProgram`, converted to an Ising `SparsePauliOp`, and normalised so QAOA angles transfer across instances.
 
+**The QAOA circuit** (`gridq.qaoa.readable_circuit`). One qubit per provider; measuring 1 means "switch on".
+- **H** on every qubit: an equal superposition of all 2ⁿ dispatches.
+- Each layer has a **cost** part, with **RZ** on each qubit (the provider's cost and kW) and **ZZ** on every pair (the balance term), followed by a **mixer** part, with **RX** on every qubit.
+- Then measure.
+
+For 6 providers and p = 2 that is 30 ZZ gates. Compiled for an IBM Heron chip, it becomes 105 CZ gates with two-qubit depth 77, because SWAPs are needed for the heavy-hex wiring. The trained circuit that ran on `ibm_kingston`:
+
+![QAOA circuit run on ibm_kingston](docs/qaoa_circuit_ibm_kingston.png)
+
+It is also shown in the notebook (cell 4b) and the dashboard (dispatch page and hardware page).
+
 **Feasibility repair.** A squared penalty cannot encode `supply ≥ deficit` exactly. So **every solver's output, quantum or classical**, goes through the same repair step (`classical.repair`): add the cheapest-per-kW asset while short, then trim waste. This keeps the comparison like-for-like.
 
 ## 3. Methods

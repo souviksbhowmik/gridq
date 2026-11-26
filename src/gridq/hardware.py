@@ -171,6 +171,7 @@ def score_hardware_run(path, noise_model: bool = True, seed: int = 0) -> dict:
         "deficit_kw": grid.deficit, "optimal_dispatch": dispatch_metrics(grid, exact),
         "optimal_providers": [int(i) for i in np.flatnonzero(exact)],
         "probs": {k: v.tolist() for k, v in dists.items()}, "optimal_states": np.flatnonzero(opt).tolist(),
+        "params": params.tolist(), "power": grid.power.tolist(), "cost": grid.cost.tolist(),
     }
 
 

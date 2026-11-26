@@ -152,3 +152,13 @@ def test_shipped_village_files_load():
     for f in folders:
         v = load_village(f)
         assert v.hourly_balance().coverable.all()
+
+
+def test_readable_circuit_matches_qaoa_ansatz():
+    from gridq.qaoa import readable_circuit
+
+    q = build_qubo(make_microgrid(6, seed=0))
+    params = np.random.default_rng(1).uniform(-1, 1, 4)
+    rc = readable_circuit(q, params, digits=12).remove_final_measurements(inplace=False)
+    ref = Statevector(_bind(build_ansatz(q, 2)[0], params)).probabilities()
+    assert np.allclose(Statevector(rc).probabilities(), ref, atol=1e-8)
