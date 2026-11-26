@@ -520,17 +520,75 @@ with tab_hw:
             unmit = unmit.iloc[0] if len(unmit) else rows[rows.kind == "hardware"].iloc[0]
             noise = rows[rows.setting.str.startswith("Noise model")]
 
+            # ---------------- 1. the case and what the quantum computer decided
+            case_village = f"village_n{hw['n']}_s{hw['seed']}"
+            case_hour = None
+            if (DATA / case_village / "providers.csv").exists():
+                cv = get_village(case_village)
+                cb = cv.hourly_balance()
+                hit = cb[cb.shortfall_kw.round(1) == round(hw["deficit_kw"], 1)]
+                case_hour = int(hit.hour.iloc[0]) if len(hit) else None
+                cprov = cv.providers
+            st.markdown("### 1 · The result from the real quantum computer")
+            where = f"village **{case_village}**" + (f" at **{case_hour:02d}:00**" if case_hour is not None else "")
+            st.markdown(f"Problem sent to **{hw['backend']}**: {where}: cover a **{hw['deficit_kw']:.1f} kW** "
+                        f"shortfall from **{hw['n']} providers** ({2 ** hw['n']} possible on/off combinations). "
+                        f"QAOA with p = {hw['reps']}, {hw['shots']} shots per run, submitted {hw['submitted_at']}.")
+            hrows = rows[rows.kind == "hardware"]
+            od = hw["optimal_dispatch"]
             a, b, c, d = st.columns(4)
             a.metric("Quantum computer", hw["backend"], f"IBM Heron r2 · {hw['circuit']['num_qubits']} qubits",
                      delta_color="off")
-            b.metric("Problem", f"{hw['n']} providers", f"shortfall {hw['deficit_kw']:.1f} kW · p = {hw['reps']}",
-                     delta_color="off")
-            c.metric("Real hardware vs random guess", f"{unmit.enrichment:.2f}×",
-                     f"{100 * unmit.enrichment / ideal.enrichment:.0f}% of ideal {ideal.enrichment:.2f}×",
-                     delta_color="off")
+            a_hw = hrows[hrows.setting.str.endswith("unmitigated")]
+            a_hw = a_hw.iloc[0] if len(a_hw) else hrows.iloc[0]
+            b.metric("Dispatch it chose", "providers " + ", ".join(map(str, a_hw.providers_on)),
+                     "✅ optimal" if a_hw.found_optimal else "❌ not optimal", delta_color="off")
+            c.metric("Cost of that dispatch", f"₹{a_hw.cost_inr:.1f}",
+                     f"{a_hw.supplied_kw:.1f} kW for {hw['deficit_kw']:.1f} kW needed", delta_color="off")
+            d.metric("Exact optimum (brute force)", f"₹{od['cost_inr']:.1f}",
+                     "providers " + ", ".join(map(str, hw["optimal_providers"])), delta_color="off")
+
+            res_rows = []
+            for _, r in hrows.iterrows():
+                res_rows.append({
+                    "hardware run": r.setting, "IBM job id": r.job_id,
+                    "providers switched on": ", ".join(map(str, r.providers_on)),
+                    "supplied kW": round(r.supplied_kw, 1), "shortfall kW": hw["deficit_kw"],
+                    "demand met %": 100.0 if r.supplied_kw >= hw["deficit_kw"] - 1e-9 else round(100 * r.supplied_kw / hw["deficit_kw"], 1),
+                    "cost ₹": round(r.cost_inr, 1), "optimal?": "✅" if r.found_optimal else "❌",
+                    "best answer per shot": f"{100 * r.p_optimal:.2f} %",
+                })
+            st.dataframe(pd.DataFrame(res_rows), hide_index=True, width="stretch")
+
+            if case_hour is not None:
+                on = set(a_hw.providers_on)
+                plan = pd.DataFrame({
+                    "id": cprov.provider_id, "site": cprov.site_name,
+                    "provider type": [TYPE_LABEL[t] for t in cprov.provider_type],
+                    "capacity (kW)": cprov.capacity_kw,
+                    "switch": ["🟢 ON" if i in on else "⚪ off" for i in cprov.provider_id],
+                    "cost ₹": [round(k * p, 1) if i in on else 0.0
+                               for i, k, p in zip(cprov.provider_id, cprov.capacity_kw, cprov.price_inr_per_kwh)],
+                })
+                with st.expander(f"Dispatch instruction from {hw['backend']} (per provider)", expanded=True):
+                    st.dataframe(plan, hide_index=True, width="stretch")
+            st.caption("How the answer is read out: the circuit is measured "
+                       f"{hw['shots']} times; each measurement is one on/off combination. Every sampled combination "
+                       "goes through the same feasibility repair as the classical solvers, and the cheapest one "
+                       "that covers the shortfall is the quantum computer's dispatch.")
+
+            # ---------------- 2. how good was the quantum signal
+            st.markdown("### 2 · How strong was the quantum signal? Real hardware vs simulators")
+            a, b, c, d = st.columns(4)
+            a.metric("Real hardware vs random guess", f"{unmit.enrichment:.2f}×",
+                     f"{100 * unmit.p_optimal:.2f}% vs {100 / 2 ** hw['n']:.2f}% of shots", delta_color="off")
+            b.metric("Ideal simulator", f"{ideal.enrichment:.2f}×",
+                     f"hardware keeps {100 * unmit.enrichment / ideal.enrichment:.0f}%", delta_color="off")
             if len(noise):
-                d.metric("Noise model predicted", f"{noise.iloc[0].enrichment:.2f}×",
+                c.metric("Noise model predicted", f"{noise.iloc[0].enrichment:.2f}×",
                          f"real: {unmit.enrichment:.2f}×", delta_color="off")
+            d.metric("2-qubit depth on the QPU", hw["circuit"]["two_qubit_depth"],
+                     f"{hw['circuit']['two_qubit_gates']} two-qubit gates", delta_color="off")
 
             left, right = st.columns([3, 2])
             with left:

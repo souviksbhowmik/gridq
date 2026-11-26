@@ -160,6 +160,9 @@ def score_hardware_run(path, noise_model: bool = True, seed: int = 0) -> dict:
             "expected_energy": float(p @ land),
             "fidelity_to_ideal": float(np.sum(np.sqrt(p * ideal)) ** 2),
             "found_optimal": bool(np.array_equal(best, exact)),
+            "providers_on": [int(i) for i in np.flatnonzero(best)],
+            "supplied_kw": float(grid.power @ best),
+            "cost_inr": float(grid.cost @ best),
             "job_id": d["runs"][name.split(" · ")[1]]["job_id"] if " · " in name else "",
         })
     return {
