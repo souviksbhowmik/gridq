@@ -21,7 +21,6 @@ matplotlib.use("Agg")  # headless backend: the macOS GUI backend crashes in work
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import qiskit_aer  # noqa: F401  (import early: lazy import inside Streamlit's script thread segfaults on macOS)
 import streamlit as st
 
 from gridq import (
@@ -31,6 +30,11 @@ from gridq import (
 from gridq.data import load_village
 from gridq.metrics import naive_policy_cost
 from gridq.qubo import all_bitstrings, dispatch_objective
+
+try:  # run as `streamlit run app/streamlit_app.py`
+    from qaoa_worker import solve_qaoa_isolated
+except ImportError:  # imported as a module (tests)
+    from app.qaoa_worker import solve_qaoa_isolated
 
 warnings.filterwarnings("ignore")
 st.set_page_config(page_title="GridQ: quantum microgrid dispatch", layout="wide")
@@ -77,17 +81,13 @@ def run_solver(name, grid, qubo, reps, shots, backend):
     t0 = time.perf_counter()
     extra = {}
     if name == "QAOA (quantum)":
-        sampler = pm = None
-        if backend.startswith("Noisy"):
-            from gridq.hardware import backend_pass_manager, fake_backend, noisy_sampler
-
-            fb = fake_backend()
-            sampler, pm = noisy_sampler(fb, seed=0), backend_pass_manager(fb)
-        r = solve_qaoa(qubo, reps=reps, shots=shots, sampler=sampler, pass_manager=pm)
-        x = r.repaired_x
-        extra = {"enrichment": r.enrichment, "p_optimal": r.p_optimal, "evals": r.n_evals,
-                 "two_q_depth": r.circuit_stats["two_qubit_depth"], "two_q_gates": r.circuit_stats["two_qubit_gates"],
-                 "qubits": grid.n, "shots": shots, "counts": r.counts}
+        # Qiskit runs in a separate process: its native code segfaults inside Streamlit on macOS.
+        r = solve_qaoa_isolated(grid, reps, shots, noisy=backend.startswith("Noisy"))
+        if not r["ok"]:
+            raise RuntimeError(r["error"])
+        x = np.array(r["x"], dtype=np.int8)
+        extra = {k: r[k] for k in ("enrichment", "p_optimal", "evals", "two_q_depth", "two_q_gates", "counts")}
+        extra.update(qubits=grid.n, shots=shots)
     elif name == "Exact (brute force)":
         x = constrained_optimum(qubo).x
         extra = {"evals": 2 ** grid.n}
@@ -247,7 +247,11 @@ with tab_solve:
         results = {}
         with st.spinner("Running solvers ..."):
             for nm in chosen:
-                x, rt, extra = run_solver(nm, grid, qubo, reps, shots, backend)
+                try:
+                    x, rt, extra = run_solver(nm, grid, qubo, reps, shots, backend)
+                except RuntimeError as e:
+                    st.error(f"{nm} failed: {e}")
+                    continue
                 results[nm] = {"x": x, "runtime": rt, **extra}
         st.session_state["cmp"] = {"key": (name, hour), "results": results, "backend": backend,
                                    "reps": reps, "shots": shots}
@@ -265,8 +269,12 @@ with tab_solve:
             qcost = float(grid.cost @ q["x"])
             classical = {k: r for k, r in results.items() if k not in QUANTUM and k != "Random sampling (control)"}
             a, b, c, d = st.columns(4)
-            a.metric("QAOA cost", f"₹{qcost:.0f}", f"{qcost - best_cost:+.0f} vs exact optimum ₹{best_cost:.0f}",
-                     delta_color="inverse")
+            gap = qcost - best_cost
+            if np.isclose(gap, 0):
+                a.metric("QAOA cost", f"₹{qcost:.0f}", "= exact optimum", delta_color="off")
+            else:
+                a.metric("QAOA cost", f"₹{qcost:.0f}", f"+₹{gap:.0f} vs exact optimum ₹{best_cost:.0f}",
+                         delta_color="inverse")
             if classical:
                 bc_name = min(classical, key=lambda k: float(grid.cost @ classical[k]["x"]))
                 bc_cost = float(grid.cost @ classical[bc_name]["x"])
@@ -361,7 +369,11 @@ with tab_day:
             else:
                 g = v.microgrid(int(h))
                 qb = build_qubo(g)
-                xq = repair(g, solve_qaoa(qb, reps=2, shots=256).repaired_x)
+                rq = solve_qaoa_isolated(g, 2, 256, noisy=False)
+                if not rq["ok"]:
+                    st.error(f"QAOA failed at {int(h):02d}:00: {rq['error']}")
+                    break
+                xq = repair(g, np.array(rq["x"], dtype=np.int8))
                 xe = repair(g, constrained_optimum(qb).x)
                 xo = repair(g, greedy_operator(qb).x)
                 out.append({"hour": int(h), "shortfall kW": g.deficit,

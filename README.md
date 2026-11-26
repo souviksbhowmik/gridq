@@ -253,7 +253,7 @@ Results are saved to `results/hardware_<backend>_n<n>_p<reps>_s<seed>.json`. Eac
 | `QISKIT_IBM_TOKEN is empty` | Fill in `.env` (not `.env.example`) |
 | `No backend` / authentication error | Check the CRN matches the instance that owns the QPU; set `IBM_BACKEND` to a name listed on *Compute resources* |
 | Notebook can't find `gridq` | Select the **Python (qff-gridq)** kernel |
-| Streamlit crashes on macOS | Run from the `qff-gridq` env; the app pre-imports `qiskit_aer` on the main thread to avoid a known macOS thread crash |
+| Streamlit shuts down with `segmentation fault` | Fixed: Qiskit's native code crashes inside the Streamlit server process on macOS, so the dashboard runs QAOA in a separate worker process (`app/qaoa_worker.py`). Pull the latest code. If a solve fails, the page now shows an error instead of exiting |
 
 ## 7. Repository layout
 
