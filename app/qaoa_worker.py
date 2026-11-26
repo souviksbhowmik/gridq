@@ -43,36 +43,11 @@ def _task_qaoa(n, power, cost, deficit, reps, shots, noisy):
 
 def _task_hardware(n, power, cost, deficit, reps, shots, mitigate):
     """Same pipeline as experiments/run_hardware.py, for one dashboard instance."""
-    import time
+    from gridq.hardware import run_qaoa_on_hardware
 
-    from gridq import build_qubo, repair
-    from gridq.hardware import backend_pass_manager, get_backend, hardware_sampler
-    from gridq.metrics import circuit_stats
-    from gridq.qaoa import _bind, build_ansatz, optimise_parameters
-    from gridq.qubo import bitstring_to_array, dispatch_objective, energy_landscape
-
-    grid = _grid(n, power, cost, deficit)
-    qubo = build_qubo(grid)
-    params, _, nev = optimise_parameters(qubo, reps, alpha=0.25)  # trained on the simulator: no credits
-    ansatz, _ = build_ansatz(qubo, reps)
-    circ = _bind(ansatz, params)
-    circ.measure_all()
-    backend = get_backend(min_qubits=n)
-    isa = backend_pass_manager(backend).run(circ)
-    t0 = time.perf_counter()
-    job = hardware_sampler(backend, shots=shots, mitigate=mitigate).run([isa])
-    counts = job.result()[0].data.meas.get_counts()
-    wall = time.perf_counter() - t0
-    land = energy_landscape(qubo)
-    opt = np.isclose(land, land.min())
-    total = sum(counts.values())
-    p_opt = sum(c for b, c in counts.items() if opt[int(b, 2)]) / total
-    rep = {b: repair(grid, bitstring_to_array(b)) for b in counts}
-    best = min(rep, key=lambda b: float(dispatch_objective(grid, rep[b])))
-    stats = circuit_stats(isa)
-    return {"x": rep[best].tolist(), "enrichment": p_opt * land.size / opt.sum(), "p_optimal": p_opt,
-            "evals": nev, "two_q_depth": stats["two_qubit_depth"], "two_q_gates": stats["two_qubit_gates"],
-            "counts": counts, "backend": backend.name, "job_id": job.job_id(), "queue_and_run_s": wall}
+    r = run_qaoa_on_hardware(_grid(n, power, cost, deficit), reps=reps, shots=shots, mitigate=mitigate)
+    r.pop("params", None)
+    return r
 
 
 def _task_score(path):

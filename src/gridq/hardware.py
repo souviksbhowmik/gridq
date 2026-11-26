@@ -172,3 +172,42 @@ def score_hardware_run(path, noise_model: bool = True, seed: int = 0) -> dict:
         "optimal_providers": [int(i) for i in np.flatnonzero(exact)],
         "probs": {k: v.tolist() for k, v in dists.items()}, "optimal_states": np.flatnonzero(opt).tolist(),
     }
+
+
+def run_qaoa_on_hardware(grid, reps: int = 2, shots: int = 4096, mitigate: bool = False) -> dict:
+    """Train QAOA on the simulator (free), then sample the circuit once on a real IBM QPU.
+
+    Uses the backend from .env (IBM_BACKEND, or the least-busy QPU). Submits
+    one job and waits for it. Returns the decoded dispatch and quality numbers.
+    """
+    import time
+
+    import numpy as np
+
+    from .classical import repair
+    from .metrics import circuit_stats
+    from .qaoa import _bind, build_ansatz, optimise_parameters
+    from .qubo import bitstring_to_array, build_qubo, dispatch_objective, energy_landscape
+
+    qubo = build_qubo(grid)
+    params, _, nev = optimise_parameters(qubo, reps, alpha=0.25)
+    ansatz, _ = build_ansatz(qubo, reps)
+    circ = _bind(ansatz, params)
+    circ.measure_all()
+    backend = get_backend(min_qubits=grid.n)
+    isa = backend_pass_manager(backend).run(circ)
+    t0 = time.perf_counter()
+    job = hardware_sampler(backend, shots=shots, mitigate=mitigate).run([isa])
+    counts = job.result()[0].data.meas.get_counts()
+    wall = time.perf_counter() - t0
+    land = energy_landscape(qubo)
+    opt = np.isclose(land, land.min())
+    total = sum(counts.values())
+    p_opt = sum(c for b, c in counts.items() if opt[int(b, 2)]) / total
+    rep = {b: repair(grid, bitstring_to_array(b)) for b in counts}
+    best = min(rep, key=lambda b: float(dispatch_objective(grid, rep[b])))
+    stats = circuit_stats(isa)
+    return {"x": rep[best].tolist(), "enrichment": p_opt * land.size / opt.sum(), "p_optimal": p_opt,
+            "evals": nev, "two_q_depth": stats["two_qubit_depth"], "two_q_gates": stats["two_qubit_gates"],
+            "counts": counts, "backend": backend.name, "job_id": job.job_id(), "queue_and_run_s": wall,
+            "params": params.tolist()}
