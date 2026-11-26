@@ -3,14 +3,15 @@
     streamlit run app/streamlit_app.py
 
 Tabs:
-  1. Village master data   sites, flexible assets, lines (from data/villages/*.csv)
-  2. Demand & supply       hourly demand per site, solar, wind, the deficit to dispatch
-  3. Dispatch (one hour)   QAOA vs classical solvers for the selected hour
+  1. Demand & shortfall    village demand forecast vs solar + wind, hourly shortfall
+  2. Providers             the flexible providers that can cover the shortfall
+  3. Dispatch & compare    pick an hour, run several solvers, compare allocations
   4. 24-hour plan          hour-by-hour dispatch, cost vs diesel-first
 """
 
 from __future__ import annotations
 
+import time
 import warnings
 from pathlib import Path
 
@@ -18,31 +19,40 @@ import matplotlib
 
 matplotlib.use("Agg")  # headless backend: the macOS GUI backend crashes in worker threads
 import matplotlib.pyplot as plt
-import networkx as nx
 import numpy as np
 import pandas as pd
 import qiskit_aer  # noqa: F401  (import early: lazy import inside Streamlit's script thread segfaults on macOS)
 import streamlit as st
 
 from gridq import (
-    build_qubo, constrained_optimum, cost_saved_pct, dispatch_metrics, greedy_operator,
+    build_qubo, constrained_optimum, cost_saved_pct, dispatch_metrics, greedy_descent, greedy_operator,
     random_sampling, repair, simulated_annealing, solve_qaoa,
 )
 from gridq.data import load_village
 from gridq.metrics import naive_policy_cost
+from gridq.qubo import all_bitstrings, dispatch_objective
 
 warnings.filterwarnings("ignore")
 st.set_page_config(page_title="GridQ: quantum microgrid dispatch", layout="wide")
 
 DATA = Path(__file__).resolve().parents[1] / "data" / "villages"
-ICON = {"household": "🏠", "school": "🏫", "water_pump": "🚰", "cold_store": "❄️", "clinic": "🏥"}
-ASSET_ICON = {"battery": "🔋 battery", "diesel": "⛽ diesel genset", "demand_response": "🤝 demand response"}
-CRIT = "#c62828"
+TYPE_LABEL = {"battery": "🔋 battery", "diesel": "⛽ diesel genset", "demand_response": "🤝 demand response"}
+TYPE_COLOUR = {"battery": "#43a047", "demand_response": "#1e88e5", "diesel": "#757575"}
+
+SOLVERS = {
+    "QAOA (quantum)": "Quantum: QAOA circuit trained with COBYLA, sampled on the chosen backend",
+    "Exact (brute force)": "Classical: checks all 2ⁿ combinations, which is the ground truth",
+    "Simulated annealing": "Classical metaheuristic: random bit flips with cooling",
+    "Greedy (cheapest per kW)": "Classical rule of thumb: switch on the cheapest per kW until covered",
+    "Greedy descent (QUBO)": "Classical local search on the same QUBO as QAOA",
+    "Random sampling (control)": "Control: random on/off combinations with the same shot budget as QAOA",
+}
+QUANTUM = {"QAOA (quantum)"}
 
 
 @st.cache_data
 def village_names() -> list[str]:
-    return sorted(p.name for p in DATA.iterdir() if (p / "sites.csv").exists())
+    return sorted(p.name for p in DATA.iterdir() if (p / "providers.csv").exists())
 
 
 @st.cache_resource
@@ -50,124 +60,116 @@ def get_village(name: str):
     return load_village(DATA / name)
 
 
-def draw_grid(v, x=None, title="", figsize=(5.2, 4.2)):
-    g = nx.Graph()
-    g.add_nodes_from(range(v.n))
-    over = []
-    p = v.sites.asset_kw.to_numpy()
-    for r in v.lines.itertuples():
-        i, j = int(r.from_site), int(r.to_site)
-        g.add_edge(i, j)
-        if x is not None and x[i] and x[j] and p[i] + p[j] > r.capacity_kw:
-            over.append((i, j))
-    fig, ax = plt.subplots(figsize=figsize)
-    pos = nx.spring_layout(g, seed=1)
-    colours = ["#e3f2fd"] * v.n if x is None else ["#2e7d32" if x[i] else "#eceff1" for i in range(v.n)]
-    nx.draw_networkx_edges(g, pos, ax=ax, edge_color="#90a4ae", width=1.5)
-    nx.draw_networkx_edges(g, pos, edgelist=over, ax=ax, edge_color="#d32f2f", width=3.5)
-    nx.draw_networkx_nodes(g, pos, ax=ax, node_color=colours, node_size=900,
-                           edgecolors=[CRIT if c else "#455a64" for c in v.sites.critical], linewidths=2.2)
-    font = ["white" if (x is not None and x[i]) else "black" for i in range(v.n)]
-    for i in range(v.n):
-        ax.text(*pos[i], f"{i}\n{p[i]:.1f}kW", ha="center", va="center", fontsize=7, color=font[i])
-    ax.set_title(title, fontsize=10)
-    ax.axis("off")
+def provider_labels(v) -> list[str]:
+    return [f"{int(i)} · {n}" for i, n in zip(v.providers.provider_id, v.providers.site_name)]
+
+
+def feasible_quality(grid, x) -> float:
+    """1 = optimal dispatch, 0 = worst feasible dispatch."""
+    X = all_bitstrings(grid.n)
+    obj = dispatch_objective(grid, X)
+    feas = X @ grid.power >= grid.deficit - 1e-9
+    lo, hi = obj[feas].min(), obj[feas].max()
+    return 1.0 if np.isclose(hi, lo) else float((hi - dispatch_objective(grid, x)) / (hi - lo))
+
+
+def run_solver(name, grid, qubo, reps, shots, backend):
+    t0 = time.perf_counter()
+    extra = {}
+    if name == "QAOA (quantum)":
+        sampler = pm = None
+        if backend.startswith("Noisy"):
+            from gridq.hardware import backend_pass_manager, fake_backend, noisy_sampler
+
+            fb = fake_backend()
+            sampler, pm = noisy_sampler(fb, seed=0), backend_pass_manager(fb)
+        r = solve_qaoa(qubo, reps=reps, shots=shots, sampler=sampler, pass_manager=pm)
+        x = r.repaired_x
+        extra = {"enrichment": r.enrichment, "p_optimal": r.p_optimal, "evals": r.n_evals,
+                 "two_q_depth": r.circuit_stats["two_qubit_depth"], "two_q_gates": r.circuit_stats["two_qubit_gates"],
+                 "qubits": grid.n, "shots": shots, "counts": r.counts}
+    elif name == "Exact (brute force)":
+        x = constrained_optimum(qubo).x
+        extra = {"evals": 2 ** grid.n}
+    elif name == "Simulated annealing":
+        x = simulated_annealing(qubo, sweeps=500, restarts=5).x
+        extra = {"evals": 500 * 5 * grid.n}
+    elif name == "Greedy (cheapest per kW)":
+        x = greedy_operator(qubo).x
+    elif name == "Greedy descent (QUBO)":
+        x = greedy_descent(qubo).x
+    elif name == "Random sampling (control)":
+        x = random_sampling(qubo, shots=shots, seed=0).x
+        extra = {"evals": shots}
+    runtime = time.perf_counter() - t0
+    return repair(grid, x), runtime, extra
+
+
+def draw_allocation(v, grid, results):
+    """One row per solver: stacked kW of the providers it switched on, vs the shortfall."""
+    order = np.argsort(grid.cost / grid.power)
+    fig, ax = plt.subplots(figsize=(11, 0.55 * len(results) + 1.2))
+    names = list(results)
+    for row, nm in enumerate(names):
+        x = results[nm]["x"]
+        left = 0.0
+        for i in order:
+            if x[i]:
+                ax.barh(row, grid.power[i], left=left, color=TYPE_COLOUR[grid.assets[i]], edgecolor="white")
+                ax.text(left + grid.power[i] / 2, row, str(i), ha="center", va="center", fontsize=8, color="white")
+                left += grid.power[i]
+        ax.text(left + 0.2, row, f"{left:.1f} kW · ₹{grid.cost @ x:.0f}", va="center", fontsize=8)
+    ax.axvline(grid.deficit, color="#d32f2f", ls="--", lw=2)
+    ax.text(grid.deficit, len(names) - 0.4, f" shortfall {grid.deficit:.1f} kW", color="#d32f2f", fontsize=8)
+    ax.set_yticks(range(len(names)), names)
+    ax.invert_yaxis()
+    ax.set_xlabel("kW switched on (numbers = provider id; green battery · blue demand response · grey diesel)")
+    ax.set_xlim(0, max(grid.deficit, max(results[n]["x"] @ grid.power for n in names)) * 1.35)
     fig.tight_layout()
     return fig
 
 
-def site_labels(v) -> list[str]:
-    return [f"{ICON[t]} {n}" for t, n in zip(v.sites.site_type, v.sites.site_name)]
-
-
 # --------------------------------------------------------------------------- sidebar
 st.title("GridQ: QAOA load balancing for rural microgrids")
-st.caption("QFF 2026 Quantum for Humanity · Climate track · All data is synthetic, "
-           "stored as editable CSVs in `data/villages/`.")
+st.caption("QFF 2026 Quantum for Humanity · Climate track · Synthetic data in `data/villages/` "
+           "(providers.csv, forecast.csv).")
 
 names = village_names()
 with st.sidebar:
-    st.header("1 · Village")
-    name = st.selectbox("Village master data", names,
+    st.header("Village")
+    name = st.selectbox("Village data", names,
                         index=names.index("village_n8_s0") if "village_n8_s0" in names else 0)
     v = get_village(name)
     bal = v.hourly_balance()
     need_hours = bal[bal.dispatch_needed & bal.coverable].hour.astype(int).tolist()
-    peak_hour = int(bal.loc[bal.net_deficit_kw.idxmax(), "hour"])
+    peak_hour = int(bal.loc[bal.shortfall_kw.idxmax(), "hour"])
     hour = st.select_slider("Dispatch hour", options=need_hours, value=peak_hour,
                             format_func=lambda h: f"{h:02d}:00")
-    st.caption("Only hours where renewables fall short are listed.")
-    st.header("2 · QAOA")
-    reps = st.slider("Layers p", 1, 5, 3)
-    shots = st.select_slider("Shots", [64, 128, 256, 512, 1024, 4096], 256)
-    backend = st.radio("Backend", ["Ideal simulator", "Noisy simulator (IBM Heron snapshot)"])
+    st.caption("Only hours with a shortfall are listed.")
 
 row = bal.set_index("hour").loc[hour]
 grid = v.microgrid(hour)
 qubo = build_qubo(grid)
 
-tab_data, tab_demand, tab_solve, tab_day = st.tabs(
-    ["📋 Village master data", "⚡ Demand & supply", "🧮 Dispatch (one hour)", "📅 24-hour plan"])
+tab_demand, tab_prov, tab_solve, tab_day = st.tabs(
+    ["⚡ Demand & shortfall", "🔌 Providers", "🧮 Dispatch & compare solvers", "📅 24-hour plan"])
 
-# --------------------------------------------------------------------------- tab 1: master data
-with tab_data:
-    st.subheader(f"{name}: {v.n} sites")
-    a, b, c, d = st.columns(4)
-    a.metric("Sites", v.n)
-    b.metric("Critical sites", int(v.sites.critical.sum()))
-    c.metric("Flexible capacity", f"{v.sites.asset_kw.sum():.1f} kW")
-    d.metric("Solar PV installed", f"{v.meta.get('solar_capacity_kw', 0):.1f} kW")
-
-    left, right = st.columns([3, 2])
-    with left:
-        st.markdown("**Sites and their flexible assets** · `sites.csv`")
-        show = pd.DataFrame({
-            "id": v.sites.site_id,
-            "site": site_labels(v),
-            "critical": v.sites.critical,
-            "peak demand (kW)": v.sites.peak_demand_kw,
-            "flexible asset": [ASSET_ICON[a] for a in v.sites.asset],
-            "asset output (kW)": v.sites.asset_kw,
-            "price (₹/kWh)": v.sites.price_inr_per_kwh.round(1),
-            "cost if on 1 h (₹)": (v.sites.asset_kw * v.sites.price_inr_per_kwh).round(1),
-        })
-        st.dataframe(show, hide_index=True, width="stretch")
-        st.caption("**Peak demand** = the most this site consumes in a day. **Asset output** = the extra power "
-                   "its flexible asset can feed into the shared village grid when switched on.")
-        st.markdown("**Distribution lines** · `lines.csv`")
-        pk = v.sites.asset_kw.to_numpy()
-        ln = pd.DataFrame({
-            "from": v.lines.from_site, "to": v.lines.to_site, "capacity (kW)": v.lines.capacity_kw,
-            "both assets on (kW)": [round(pk[i] + pk[j], 1) for i, j in zip(v.lines.from_site, v.lines.to_site)],
-        })
-        ln["overloads if both on"] = ln["both assets on (kW)"] > ln["capacity (kW)"]
-        st.dataframe(ln, hide_index=True, width="stretch")
-    with right:
-        st.pyplot(draw_grid(v, None, "Village grid (red ring = critical site, label = asset kW)"))
-        plt.close("all")
-        st.markdown("**Flexible assets by type**")
-        summary = v.sites.groupby("asset").agg(
-            sites=("site_id", "size"), total_kW=("asset_kw", "sum"), avg_price_per_kWh=("price_inr_per_kwh", "mean"),
-        ).round(1)
-        summary.index = [ASSET_ICON[i] for i in summary.index]
-        st.dataframe(summary, width="stretch")
-        st.caption(f"Files: `data/villages/{name}/`: sites.csv, lines.csv, site_demand.csv, renewables.csv")
-
-# --------------------------------------------------------------------------- tab 2: demand
+# --------------------------------------------------------------------------- tab 1: demand & shortfall
 with tab_demand:
-    st.subheader("Village demand vs renewable supply")
+    st.subheader("Village demand forecast vs renewable supply")
     a, b, c, d = st.columns(4)
-    a.metric(f"Demand at {hour:02d}:00", f"{row.demand_kw:.1f} kW")
-    b.metric("Solar + wind", f"{row.solar_kw + row.wind_kw:.1f} kW")
-    c.metric("Deficit to dispatch", f"{row.net_deficit_kw:.1f} kW")
-    d.metric("Hours needing dispatch", f"{int(bal.dispatch_needed.sum())} / 24")
+    a.metric("Peak demand", f"{bal.demand_kw.max():.1f} kW", f"at {int(bal.loc[bal.demand_kw.idxmax(), 'hour']):02d}:00",
+             delta_color="off")
+    b.metric("Peak shortfall", f"{bal.shortfall_kw.max():.1f} kW", f"at {peak_hour:02d}:00", delta_color="off")
+    c.metric("Hours with a shortfall", f"{int(bal.dispatch_needed.sum())} / 24")
+    d.metric("Shortfall energy per day", f"{bal.shortfall_kw.clip(lower=0).sum():.0f} kWh")
 
-    fig, ax = plt.subplots(figsize=(11, 3.6))
+    fig, ax = plt.subplots(figsize=(11, 3.8))
     ax.stackplot(bal.hour, bal.solar_kw, bal.wind_kw, labels=["solar", "wind"],
                  colors=["#ffd54f", "#81d4fa"], alpha=0.85)
-    ax.plot(bal.hour, bal.demand_kw, "k-", lw=2.2, label="village demand")
-    ax.fill_between(bal.hour, bal.solar_kw + bal.wind_kw, bal.demand_kw,
-                    where=bal.net_deficit_kw > 0, color="#ef5350", alpha=0.25, label="deficit → dispatch")
+    ax.plot(bal.hour, bal.demand_kw, "k-", lw=2.4, marker="o", ms=3, label="village demand (forecast)")
+    ax.fill_between(bal.hour, bal.renewables_kw, bal.demand_kw, where=bal.shortfall_kw > 0,
+                    color="#ef5350", alpha=0.3, label="shortfall → providers must cover")
     ax.axvline(hour, color="#6a1b9a", ls="--", lw=1.5)
     ax.text(hour + 0.15, ax.get_ylim()[1] * 0.92, f"selected {hour:02d}:00", color="#6a1b9a", fontsize=9)
     ax.set(xlabel="hour of day", ylabel="kW", xticks=range(0, 24, 2), xlim=(0, 23))
@@ -176,114 +178,175 @@ with tab_demand:
     st.pyplot(fig)
     plt.close(fig)
 
+    st.markdown(f"**At {hour:02d}:00:** demand **{row.demand_kw:.1f} kW** − solar **{row.solar_kw:.1f} kW** − "
+                f"wind **{row.wind_kw:.1f} kW** = shortfall **{row.shortfall_kw:.1f} kW**")
+    table = bal.rename(columns={
+        "demand_kw": "demand (kW)", "solar_kw": "solar (kW)", "wind_kw": "wind (kW)",
+        "renewables_kw": "solar + wind (kW)", "shortfall_kw": "shortfall (kW)", "dispatch_needed": "dispatch needed",
+    }).drop(columns="coverable")
+    table["shortfall (kW)"] = table["shortfall (kW)"].clip(lower=0)
+    table.insert(0, "time", [f"{int(h):02d}:00" for h in table.hour])
+    st.dataframe(table.drop(columns="hour"), hide_index=True, width="stretch", height=300)
+    st.caption("Shortfall = demand − solar − wind (`forecast.csv`). Negative values mean renewables cover demand, "
+               "so they are shown as 0. Every hour with a shortfall is one optimisation problem.")
+
+# --------------------------------------------------------------------------- tab 2: providers
+with tab_prov:
+    st.subheader(f"Flexible providers: {v.n} that can be switched on to cover a shortfall")
+    a, b, c, d = st.columns(4)
+    a.metric("Providers (= qubits)", v.n)
+    b.metric("Total capacity", f"{v.providers.capacity_kw.sum():.1f} kW")
+    c.metric("Peak shortfall", f"{bal.shortfall_kw.max():.1f} kW")
+    d.metric("Possible combinations", f"2^{v.n} = {2 ** v.n:,}")
     left, right = st.columns([3, 2])
-    labels = site_labels(v)
     with left:
-        st.markdown("**Hourly demand per site** (kW) · `site_demand.csv`")
-        fig, ax = plt.subplots(figsize=(7, 3.4))
-        ax.stackplot(bal.hour, v.demand.T.to_numpy(), labels=labels, alpha=0.9)
-        ax.axvline(hour, color="#6a1b9a", ls="--", lw=1.5)
-        ax.set(xlabel="hour", ylabel="kW", xticks=range(0, 24, 2), xlim=(0, 23))
-        ax.legend(fontsize=6.5, loc="upper left", ncol=2)
+        show = pd.DataFrame({
+            "id": v.providers.provider_id,
+            "site": v.providers.site_name,
+            "provider type": [TYPE_LABEL[t] for t in v.providers.provider_type],
+            "capacity (kW)": v.providers.capacity_kw,
+            "price (₹/kWh)": v.providers.price_inr_per_kwh.round(1),
+            "cost if on 1 h (₹)": (v.providers.capacity_kw * v.providers.price_inr_per_kwh).round(1),
+        })
+        st.dataframe(show, hide_index=True, width="stretch")
+        st.caption("`providers.csv`. Every provider feeds the shared village pool, so any of them can serve the "
+                   "shortfall. Demand response adds power by cutting that site's own use.")
+    with right:
+        p = v.providers.sort_values("price_inr_per_kwh").reset_index(drop=True)
+        fig, ax = plt.subplots(figsize=(5.6, 4))
+        ax.bar(range(len(p)), p.capacity_kw, color=[TYPE_COLOUR[t] for t in p.provider_type])
+        for k, r in p.iterrows():
+            ax.text(k, r.capacity_kw + 0.1, f"₹{r.price_inr_per_kwh:.0f}", ha="center", fontsize=7)
+        ax.set_xticks(range(len(p)), p.provider_id.astype(int))
+        ax.set(xlabel="provider id (cheapest per kWh first)", ylabel="capacity (kW)",
+               title="Capacity and price (label = ₹/kWh)")
+        handles = [plt.Rectangle((0, 0), 1, 1, color=c) for c in TYPE_COLOUR.values()]
+        ax.legend(handles, ["battery", "demand response", "diesel"], fontsize=7, loc="upper left")
         fig.tight_layout()
         st.pyplot(fig)
         plt.close(fig)
-    with right:
-        st.markdown(f"**Who is consuming at {hour:02d}:00**")
-        now = pd.DataFrame({"site": labels, "demand (kW)": v.demand.loc[hour].to_numpy(),
-                            "critical": v.sites.critical.to_numpy()})
-        now["share %"] = (100 * now["demand (kW)"] / now["demand (kW)"].sum()).round(1)
-        st.dataframe(now.sort_values("demand (kW)", ascending=False), hide_index=True, width="stretch")
 
-    with st.expander("Hourly balance table (all 24 hours)"):
-        st.dataframe(bal, hide_index=True, width="stretch")
-    st.caption("Deficit = Σ site demand − solar − wind. Each hour with a deficit becomes one optimisation: "
-               "choose which flexible assets to switch on to cover it.")
-
-# --------------------------------------------------------------------------- tab 3: one-hour dispatch
+# --------------------------------------------------------------------------- tab 3: dispatch & compare
 with tab_solve:
     st.subheader(f"Dispatch for {hour:02d}:00: cover {grid.deficit:.1f} kW at least cost")
     st.markdown(f"Demand **{row.demand_kw:.1f} kW** − solar **{row.solar_kw:.1f}** − wind **{row.wind_kw:.1f}** "
-                f"= deficit **{grid.deficit:.1f} kW**, to be covered from **{v.n} flexible assets** "
-                f"(**{v.sites.asset_kw.sum():.1f} kW** available): **2^{v.n} = {2**v.n}** possible on/off combinations.")
-    if st.button("Solve dispatch", type="primary"):
-        with st.spinner("Training QAOA angles and sampling ..."):
-            sampler = pm = None
-            if backend.startswith("Noisy"):
-                from gridq.hardware import backend_pass_manager, fake_backend, noisy_sampler
+                f"= shortfall **{grid.deficit:.1f} kW**, from **{v.n} providers** "
+                f"(**{v.providers.capacity_kw.sum():.1f} kW** available), giving **{2 ** v.n:,}** possible on/off combinations.")
 
-                fb = fake_backend()
-                sampler, pm = noisy_sampler(fb, seed=0), backend_pass_manager(fb)
-            q = solve_qaoa(qubo, reps=reps, shots=shots, sampler=sampler, pass_manager=pm)
-            exact = constrained_optimum(qubo).x
-            sols = {
-                "QAOA (quantum)": q.repaired_x,
-                "Exact optimum": exact,
-                "Simulated annealing": simulated_annealing(qubo, sweeps=500, restarts=5).x,
-                "Operator rule (cheapest first)": greedy_operator(qubo).x,
-                "Random sampling (control)": random_sampling(qubo, shots=shots, seed=0).x,
-            }
-            rows = []
-            for nm, xs in sols.items():
-                xs = repair(grid, xs)
-                m = dispatch_metrics(grid, xs)
-                rows.append({"solver": nm, "optimal": bool(np.array_equal(xs, exact)),
-                             "assets on": ", ".join(str(i) for i in np.flatnonzero(xs)),
-                             "supplied kW": m["supplied_kw"], "demand met %": m["demand_met_pct"],
-                             "cost ₹": m["cost_inr"], "saved vs diesel-first %": cost_saved_pct(grid, xs),
-                             "overloaded lines": m["overloaded_lines"], "critical sites on": m["critical_assets_on"]})
-        st.session_state["result"] = (name, hour, backend, q, rows, exact)
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        chosen = st.multiselect("Solvers to run", list(SOLVERS), default=list(SOLVERS),
+                                help="\n".join(f"• {k}: {d}" for k, d in SOLVERS.items()))
+    with c2:
+        q1, q2, q3 = st.columns(3)
+        reps = q1.selectbox("QAOA layers p", [1, 2, 3, 4, 5], index=2)
+        shots = q2.selectbox("Shots", [64, 128, 256, 512, 1024, 4096], index=2)
+        backend = q3.selectbox("QAOA backend", ["Ideal simulator", "Noisy simulator (IBM Heron snapshot)"])
 
-    res = st.session_state.get("result")
-    if res and res[0] == name and res[1] == hour:
-        _, _, used_backend, q, rows, exact = res
-        x = q.repaired_x
-        qm = dispatch_metrics(grid, x)
-        st.caption(f"Backend: {used_backend} · p = {q.reps}")
-        a, b, c, d = st.columns(4)
-        a.metric("Demand met", f"{qm['demand_met_pct']:.0f} %",
-                 f"{qm['supplied_kw']:.1f} of {grid.deficit:.1f} kW", delta_color="off")
-        b.metric("Cost this hour", f"₹{qm['cost_inr']:.0f}",
-                 f"-{cost_saved_pct(grid, x):.0f}% vs diesel-first ₹{naive_policy_cost(grid):.0f}")
-        c.metric("P(optimal) vs random guess", f"{q.enrichment:.1f}×")
-        d.metric("2-qubit depth", q.circuit_stats["two_qubit_depth"])
+    if st.button("Run solvers", type="primary", disabled=not chosen):
+        results = {}
+        with st.spinner("Running solvers ..."):
+            for nm in chosen:
+                x, rt, extra = run_solver(nm, grid, qubo, reps, shots, backend)
+                results[nm] = {"x": x, "runtime": rt, **extra}
+        st.session_state["cmp"] = {"key": (name, hour), "results": results, "backend": backend,
+                                   "reps": reps, "shots": shots}
 
-        left, right = st.columns([1, 1])
-        with left:
-            st.pyplot(draw_grid(v, x, "QAOA dispatch (green = asset on, red line = overload)"))
-            plt.close("all")
-        with right:
-            st.markdown("**Dispatch instruction for the operator**")
-            plan = pd.DataFrame({
-                "id": v.sites.site_id, "site": site_labels(v),
-                "asset": [ASSET_ICON[a] for a in v.sites.asset], "kW": v.sites.asset_kw,
-                "switch": np.where(x == 1, "🟢 ON", "⚪ off"), "cost ₹": np.where(x == 1, grid.cost, 0.0),
+    cmp = st.session_state.get("cmp")
+    if cmp and cmp["key"] == (name, hour):
+        results = cmp["results"]
+        exact = constrained_optimum(qubo).x
+        best_cost = float(grid.cost @ exact)
+        diesel = naive_policy_cost(grid)
+
+        # ---- headline: quantum vs best classical
+        if "QAOA (quantum)" in results:
+            q = results["QAOA (quantum)"]
+            qcost = float(grid.cost @ q["x"])
+            classical = {k: r for k, r in results.items() if k not in QUANTUM and k != "Random sampling (control)"}
+            a, b, c, d = st.columns(4)
+            a.metric("QAOA cost", f"₹{qcost:.0f}", f"{qcost - best_cost:+.0f} vs exact optimum ₹{best_cost:.0f}",
+                     delta_color="inverse")
+            if classical:
+                bc_name = min(classical, key=lambda k: float(grid.cost @ classical[k]["x"]))
+                bc_cost = float(grid.cost @ classical[bc_name]["x"])
+                b.metric("Best classical", f"₹{bc_cost:.0f}", bc_name, delta_color="off")
+            c.metric("QAOA: P(optimal) vs random guess", f"{q['enrichment']:.1f}×")
+            d.metric("QAOA circuit", f"{q['qubits']} qubits", f"2-qubit depth {q['two_q_depth']}", delta_color="off")
+
+        # ---- allocation per solver
+        st.markdown("**Allocation of providers by each solver**")
+        st.pyplot(draw_allocation(v, grid, results))
+        plt.close("all")
+
+        alloc = pd.DataFrame({"provider": provider_labels(v),
+                              "type": [TYPE_LABEL[t] for t in v.providers.provider_type],
+                              "kW": v.providers.capacity_kw})
+        for nm, r in results.items():
+            alloc[nm] = np.where(r["x"] == 1, "🟢 ON", "·")
+        with st.expander("Allocation table (which provider each solver switched on)", expanded=False):
+            st.dataframe(alloc, hide_index=True, width="stretch")
+
+        # ---- comparison table
+        st.markdown("**Solver comparison**")
+        rows = []
+        for nm, r in results.items():
+            x = r["x"]
+            m = dispatch_metrics(grid, x)
+            cost = float(grid.cost @ x)
+            rows.append({
+                "solver": nm,
+                "kind": "quantum" if nm in QUANTUM else ("control" if "Random" in nm else "classical"),
+                "providers on": ", ".join(str(i) for i in np.flatnonzero(x)),
+                "supplied kW": m["supplied_kw"],
+                "surplus kW": m["surplus_kw"],
+                "demand met %": m["demand_met_pct"],
+                "cost ₹": round(cost, 1),
+                "gap to optimum ₹": round(cost - best_cost, 1),
+                "optimal?": "✅" if np.array_equal(x, exact) else "❌",
+                "quality (1 = optimal)": round(feasible_quality(grid, x), 3),
+                "saved vs diesel-first %": cost_saved_pct(grid, x),
+                "runtime ms": round(1000 * r["runtime"], 1),
+                "evaluations": r.get("evals"),
             })
-            st.dataframe(plan, hide_index=True, width="stretch")
-        top = sorted(q.counts.items(), key=lambda kv: -kv[1])[:15]
-        e_opt = qubo.energy(exact)
-        e = [qubo.energy(np.array([int(ch) for ch in reversed(k)])) for k, _ in top]
-        fig, ax = plt.subplots(figsize=(11, 2.8))
-        ax.bar(range(len(top)), [val for _, val in top],
-               color=["#2e7d32" if np.isclose(ei, e_opt) else "#78909c" for ei in e])
-        ax.set_xticks(range(len(top)), [k for k, _ in top], rotation=90, fontsize=7)
-        ax.set(title="Most-sampled dispatches from the quantum circuit (green = optimal)", ylabel="shots")
-        fig.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
-
-        st.markdown("**Solver comparison** (every solver passes through the same feasibility repair)")
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-        st.info("Honest take: at village scale (≤12 assets) classical solvers are exact and instant. QAOA "
-                "concentrates probability on good dispatches, but any advantage would have to come at "
-                "scales today's hardware can't yet run reliably. See README → Limitations.")
+        st.caption(f"Diesel-first (status quo) cost this hour: ₹{diesel:.0f}. Every solver's output passes through "
+                   "the same feasibility repair, so the comparison is like-for-like. **Quality** = 1 for the optimum "
+                   "and 0 for the worst dispatch that still covers the shortfall.")
+
+        # ---- quantum details
+        if "QAOA (quantum)" in results:
+            q = results["QAOA (quantum)"]
+            with st.expander("Quantum details: QAOA output distribution and circuit", expanded=False):
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Backend", "noisy" if cmp["backend"].startswith("Noisy") else "ideal")
+                k2.metric("Layers p / shots", f"{cmp['reps']} / {cmp['shots']}")
+                k3.metric("P(optimal) per shot", f"{q['p_optimal']:.3f}", f"random: {1 / 2 ** grid.n:.4f}",
+                          delta_color="off")
+                k4.metric("2-qubit gates", q["two_q_gates"])
+                top = sorted(q["counts"].items(), key=lambda kv: -kv[1])[:15]
+                e_opt = qubo.energy(exact)
+                e = [qubo.energy(np.array([int(ch) for ch in reversed(k)])) for k, _ in top]
+                fig, ax = plt.subplots(figsize=(11, 2.8))
+                ax.bar(range(len(top)), [val for _, val in top],
+                       color=["#2e7d32" if np.isclose(ei, e_opt) else "#78909c" for ei in e])
+                ax.set_xticks(range(len(top)), [k for k, _ in top], rotation=90, fontsize=7)
+                ax.set(title="Most-sampled on/off combinations (green = optimal; bit i from the right = provider i)",
+                       ylabel="shots")
+                fig.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+
+        st.info("Honest take: at village scale (≤12 providers) exact search is instant and always optimal. QAOA finds "
+                "the optimum and concentrates probability on it, but it is slower and its edge over random sampling "
+                "is small at this size. Any advantage would need much larger problems than today's hardware runs reliably.")
     else:
-        st.info("Pick an hour in the sidebar and press **Solve dispatch**.")
+        st.info("Choose solvers and press **Run solvers**.")
 
 # --------------------------------------------------------------------------- tab 4: 24-hour plan
 with tab_day:
     st.subheader("24-hour dispatch plan")
-    st.caption("One optimisation per hour with a deficit. QAOA runs on the ideal simulator (p = 2, 256 shots) "
+    st.caption("One optimisation per hour with a shortfall. QAOA runs on the ideal simulator (p = 2, 256 shots) "
                "to keep this fast (about 5 s).")
     if st.button("Plan the whole day"):
         out = []
@@ -292,8 +355,8 @@ with tab_day:
         for k, h in enumerate(b2.index):
             r = b2.loc[h]
             if not (r.dispatch_needed and r.coverable):
-                out.append({"hour": int(h), "deficit kW": 0.0, "assets on (QAOA)": "none needed",
-                            "QAOA ₹": 0.0, "exact ₹": 0.0, "operator rule ₹": 0.0, "diesel-first ₹": 0.0,
+                out.append({"hour": int(h), "shortfall kW": 0.0, "providers on (QAOA)": "none needed",
+                            "QAOA ₹": 0.0, "exact ₹": 0.0, "greedy ₹": 0.0, "diesel-first ₹": 0.0,
                             "QAOA optimal": True})
             else:
                 g = v.microgrid(int(h))
@@ -301,10 +364,10 @@ with tab_day:
                 xq = repair(g, solve_qaoa(qb, reps=2, shots=256).repaired_x)
                 xe = repair(g, constrained_optimum(qb).x)
                 xo = repair(g, greedy_operator(qb).x)
-                out.append({"hour": int(h), "deficit kW": g.deficit,
-                            "assets on (QAOA)": ", ".join(str(i) for i in np.flatnonzero(xq)),
+                out.append({"hour": int(h), "shortfall kW": g.deficit,
+                            "providers on (QAOA)": ", ".join(str(i) for i in np.flatnonzero(xq)),
                             "QAOA ₹": float(g.cost @ xq), "exact ₹": float(g.cost @ xe),
-                            "operator rule ₹": float(g.cost @ xo), "diesel-first ₹": naive_policy_cost(g),
+                            "greedy ₹": float(g.cost @ xo), "diesel-first ₹": naive_policy_cost(g),
                             "QAOA optimal": bool(np.array_equal(xq, xe))})
             prog.progress((k + 1) / len(b2))
         st.session_state["day"] = (name, pd.DataFrame(out))
@@ -312,17 +375,17 @@ with tab_day:
     day = st.session_state.get("day")
     if day and day[0] == name:
         df = day[1]
-        tot = df[["QAOA ₹", "exact ₹", "operator rule ₹", "diesel-first ₹"]].sum()
+        tot = df[["QAOA ₹", "exact ₹", "greedy ₹", "diesel-first ₹"]].sum()
         a, b, c, d = st.columns(4)
         a.metric("Diesel-first (status quo)", f"₹{tot['diesel-first ₹']:,.0f}")
-        b.metric("Operator rule", f"₹{tot['operator rule ₹']:,.0f}",
-                 f"-{100 * (1 - tot['operator rule ₹'] / tot['diesel-first ₹']):.0f}%")
+        b.metric("Greedy (cheapest per kW)", f"₹{tot['greedy ₹']:,.0f}",
+                 f"-{100 * (1 - tot['greedy ₹'] / tot['diesel-first ₹']):.0f}%")
         c.metric("QAOA", f"₹{tot['QAOA ₹']:,.0f}", f"-{100 * (1 - tot['QAOA ₹'] / tot['diesel-first ₹']):.0f}%")
         d.metric("QAOA = exact optimum", f"{int(df['QAOA optimal'].sum())} / 24 h")
         fig, ax = plt.subplots(figsize=(11, 3.4))
         w = 0.28
         ax.bar(df.hour - w, df["diesel-first ₹"], w, label="diesel-first", color="#bdbdbd")
-        ax.bar(df.hour, df["operator rule ₹"], w, label="operator rule", color="#90caf9")
+        ax.bar(df.hour, df["greedy ₹"], w, label="greedy", color="#90caf9")
         ax.bar(df.hour + w, df["QAOA ₹"], w, label="QAOA", color="#2e7d32")
         ax.set(xlabel="hour", ylabel="₹ per hour", xticks=range(0, 24, 2))
         ax.legend(fontsize=8)

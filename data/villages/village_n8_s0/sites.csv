@@ -1,9 +1,0 @@
-site_id,site_name,site_type,critical,peak_demand_kw,asset,asset_kw,price_inr_per_kwh
-0,Household 0,household,False,2.97,diesel,5.6,24.857
-1,Household 1,household,False,2.78,diesel,4.5,26.578
-2,School 2,school,False,4.62,battery,4.2,4.976
-3,Clinic 3,clinic,True,3.56,demand_response,2.1,12.381
-4,Household 4,household,False,2.29,demand_response,1.6,11.375
-5,Cold Store 5,cold_store,True,4.48,diesel,5.9,25.136
-6,Water Pump 6,water_pump,True,5.11,diesel,7.6,29.118
-7,Household 7,household,False,2.8,diesel,7.7,23.818

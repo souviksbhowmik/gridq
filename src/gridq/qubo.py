@@ -1,14 +1,11 @@
 """QUBO formulation of microgrid load balancing.
 
-    H(x) = A * (sum_i p_i x_i - D)^2          balance: cover the deficit
-         + sum_i c_i x_i                      dispatch cost
-         + B * sum_(i,j) in E  w_ij x_i x_j    line overload: w_ij > 0 only if
-                                              p_i + p_j exceeds the line capacity
-         - C * sum_i r_i x_i                  reward for supplying critical loads
+    H(x) = A * (sum_i p_i x_i / D - 1)^2      balance: cover the village deficit
+         + sum_i c_i x_i                      dispatch cost (normalised, sums to 1)
 
-All terms are normalised so that A, B, C are dimensionless and comparable
-across instances. The penalty weights are calibrated so the brute-force optimum
-of H is always a "good" dispatch (see tests/test_qubo.py).
+The village is one shared pool, so every asset can serve the deficit. A is
+calibrated so the brute-force optimum of H, after feasibility repair, is close
+to the true minimum-cost dispatch (see tests/test_gridq.py).
 """
 
 from __future__ import annotations
@@ -24,12 +21,9 @@ from .data import Microgrid
 
 @dataclass
 class QuboWeights:
-    # A: calibrated over 36 instances (n = 6-10, density 0.2-0.9). Larger A
-    # makes the QUBO optimum closer to feasible but flattens the cost signal
-    # QAOA has to resolve; 20 is the compromise (see docs/formulation.md).
+    # A: larger A makes the QUBO optimum closer to feasible but flattens the
+    # cost signal QAOA has to resolve; 20 is the calibrated compromise.
     balance: float = 20.0  # A
-    congestion: float = 1.0  # B: penalty per unit of line overload
-    priority: float = 0.04  # C: small bonus for supplying critical loads
 
 
 @dataclass
@@ -97,25 +91,16 @@ def build_qubo(grid: Microgrid, weights: QuboWeights | None = None) -> Qubo:
     offset = w.balance * 1.0
 
     Q[np.diag_indices(n)] += c
-    for (i, j), stress in grid.line_stress.items():
-        a, b = min(i, j), max(i, j)
-        Q[a, b] += w.congestion * stress
-    Q[np.diag_indices(n)] -= w.priority * grid.priority
     return Qubo(Q=Q, offset=offset, grid=grid, weights=w)
 
 
 def dispatch_objective(grid: Microgrid, X: np.ndarray, weights: QuboWeights | None = None) -> np.ndarray:
-    """The *real* operator objective (cost + congestion - priority), no balance penalty.
+    """The *real* operator objective: normalised dispatch cost (no balance penalty).
 
     Used to compare solvers after feasibility repair: lower is better.
     """
-    w = weights or QuboWeights()
     X = np.atleast_2d(X).astype(float)
-    c = grid.cost / grid.cost.sum()
-    cong = np.zeros(X.shape[0])
-    for (i, j), s in grid.line_stress.items():
-        cong += s * X[:, i] * X[:, j]
-    out = X @ c + w.congestion * cong - w.priority * (X @ grid.priority)
+    out = X @ (grid.cost / grid.cost.sum())
     return out if out.shape[0] > 1 else out[0]
 
 
@@ -133,3 +118,28 @@ def energy_landscape(qubo: Qubo) -> np.ndarray:
 def bitstring_to_array(bits: str) -> np.ndarray:
     """Qiskit counts key (rightmost char = qubit 0) -> array x with x[i] = qubit i."""
     return np.array([int(b) for b in reversed(bits)], dtype=np.int8)
+
+
+def sparsify_qubo(qubo: Qubo, keep: float) -> Qubo:
+    """Keep only the strongest `keep` fraction of pairwise couplings (problem-graph density).
+
+    The full balance penalty couples every pair of assets, so the problem graph
+    is complete (density 1). Dropping the weakest couplings gives a sparser
+    problem graph: fewer ZZ terms, hence fewer two-qubit gates in QAOA, at the
+    price of solving an approximate model. Linear terms are kept unchanged.
+    """
+    if not 0 < keep <= 1:
+        raise ValueError("keep must be in (0, 1]")
+    Q = qubo.Q.copy()
+    iu = np.triu_indices(qubo.n, 1)
+    w = np.abs(Q[iu])
+    k = int(round(keep * len(w)))
+    drop = np.argsort(-w)[k:]
+    Q[iu[0][drop], iu[1][drop]] = 0.0
+    return Qubo(Q=Q, offset=qubo.offset, grid=qubo.grid, weights=qubo.weights)
+
+
+def problem_graph_density(qubo: Qubo) -> float:
+    """Share of variable pairs with a non-zero coupling (1.0 = all-to-all)."""
+    iu = np.triu_indices(qubo.n, 1)
+    return float(np.count_nonzero(qubo.Q[iu]) / len(iu[0]))

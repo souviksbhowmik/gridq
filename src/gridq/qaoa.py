@@ -188,7 +188,7 @@ def solve_qaoa(
         pass_manager: transpiler for the target backend; defaults to a
             generic optimisation-level-3 pass manager.
         alpha: CVaR fraction for the objective (1.0 = plain expectation).
-            Default 0.25: measured +40-50% enrichment vs alpha = 1 at n = 8-12.
+            Default 0.25: measured +20-40% enrichment vs alpha = 1 at n = 8-12.
     """
     from qiskit_aer.primitives import SamplerV2 as AerSampler
 

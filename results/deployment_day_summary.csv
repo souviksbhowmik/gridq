@@ -1,4 +1,4 @@
-solver,cost_inr,naive_cost_inr,line_overload_hours,saved_pct
-exact,2036.3999999999999,4898.2,0,58.4
-greedy_operator,2192.6,4898.2,0,55.2
-qaoa_p3,2036.3999999999999,4898.2,0,58.4
+solver,cost_inr,naive_cost_inr,saved_pct
+exact,1912.8999999999999,4898.2,60.9
+greedy_operator,2122.6,4898.2,56.7
+qaoa_p3,1912.8999999999999,4898.2,60.9

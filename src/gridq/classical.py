@@ -25,7 +25,7 @@ def repair(grid, x: np.ndarray) -> np.ndarray:
     Applied identically to every solver's output, so comparisons stay fair.
     1. While short: switch on the off-asset with the lowest cost per kW.
     2. Then: switch off on-assets (most expensive first) if still feasible
-       and the objective improves (never undoes a critical-load bonus).
+       and the objective improves.
     """
     x = np.asarray(x, dtype=np.int8).copy()
     ratio = grid.cost / grid.power
@@ -69,12 +69,12 @@ def brute_force(qubo: Qubo) -> SolverResult:
 def greedy_operator(qubo: Qubo) -> SolverResult:
     """What a rural grid operator does by hand today.
 
-    Switch on assets in order of cheapest cost per kW, critical-load assets
-    first among ties, until the deficit is covered. Ignores line congestion.
+    Switch on assets in order of cheapest cost per kW until the deficit is
+    covered.
     """
     t0 = time.perf_counter()
     g = qubo.grid
-    order = np.argsort(g.cost / g.power - 1e-6 * g.priority, kind="stable")
+    order = np.argsort(g.cost / g.power, kind="stable")
     x = np.zeros(g.n, dtype=np.int8)
     supplied = 0.0
     for i in order:

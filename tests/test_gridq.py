@@ -10,24 +10,34 @@ from gridq.qaoa import _bind, build_ansatz, fast_qaoa_probs, interp_init, ising_
 from gridq.qubo import all_bitstrings, bitstring_to_array, energy_landscape
 
 
-@pytest.fixture(params=[(6, 0.3, 0), (8, 0.5, 1), (10, 0.8, 2)])
+@pytest.fixture(params=[(6, 0), (8, 1), (10, 2)])
 def qubo(request):
-    n, d, s = request.param
-    return build_qubo(make_microgrid(n=n, density=d, seed=s))
+    n, s = request.param
+    return build_qubo(make_microgrid(n=n, seed=s))
 
 
-def test_generator_is_reproducible_and_connected():
-    a, b = make_microgrid(8, 0.4, seed=7), make_microgrid(8, 0.4, seed=7)
-    assert np.array_equal(a.power, b.power) and a.deficit == b.deficit
-    assert a.graph.number_of_nodes() == 8
-    import networkx as nx
-    assert nx.is_connected(a.graph)
+def test_generator_is_reproducible():
+    a, b = make_microgrid(8, seed=7), make_microgrid(8, seed=7)
+    assert np.array_equal(a.power, b.power) and a.deficit == b.deficit and a.assets == b.assets
+    assert a.n == 8 and np.isclose(a.deficit, round(0.45 * a.power.sum(), 1))
 
 
-def test_density_is_respected():
-    lo = make_microgrid(10, 0.2, seed=0).density
-    hi = make_microgrid(10, 0.9, seed=0).density
-    assert lo < hi and abs(hi - 0.9) < 0.05
+def test_hardware_instance_is_unchanged():
+    """The instance run on ibm_fez (n=6, seed=0) must stay identical for reproducibility."""
+    g = make_microgrid(6, seed=0)
+    assert g.deficit == 11.6
+    assert np.allclose(g.power, [2.3, 6.6, 3.8, 3.2, 5.0, 4.9])
+
+
+def test_sparsify_qubo_reduces_problem_graph_density():
+    from gridq import problem_graph_density, sparsify_qubo
+
+    q = build_qubo(make_microgrid(8, seed=0))
+    assert problem_graph_density(q) == 1.0  # balance term couples every pair
+    for keep in (0.2, 0.5, 0.8):
+        qs = sparsify_qubo(q, keep)
+        assert abs(problem_graph_density(qs) - keep) < 0.05
+        assert np.allclose(np.diag(qs.Q), np.diag(q.Q))  # linear terms untouched
 
 
 def test_qubo_matches_quadratic_program(qubo):
@@ -83,13 +93,13 @@ def test_classical_solvers_never_beat_brute_force(qubo):
 
 
 def test_simulated_annealing_finds_optimum_small():
-    q = build_qubo(make_microgrid(6, 0.4, seed=3))
+    q = build_qubo(make_microgrid(6, seed=3))
     assert np.isclose(simulated_annealing(q).energy, brute_force(q).energy)
 
 
 @pytest.mark.parametrize("p", [1, 2, 3])
 def test_fast_simulator_matches_qiskit(p):
-    q = build_qubo(make_microgrid(6, 0.5, seed=4))
+    q = build_qubo(make_microgrid(6, seed=4))
     ansatz, _ = build_ansatz(q, p)
     params = np.random.default_rng(p).uniform(-1, 1, 2 * p)
     ref = Statevector(_bind(ansatz, params)).probabilities()
@@ -102,7 +112,7 @@ def test_interp_shapes():
 
 
 def test_qaoa_beats_uniform_sampling():
-    q = build_qubo(make_microgrid(6, 0.4, seed=5))
+    q = build_qubo(make_microgrid(6, seed=5))
     r = solve_qaoa(q, reps=2, shots=2048)
     uniform_mean = energy_landscape(q).mean()
     assert r.expected_energy < uniform_mean
@@ -112,23 +122,23 @@ def test_qaoa_beats_uniform_sampling():
 def test_village_master_data_round_trip(tmp_path):
     from gridq.data import load_village, make_village
 
-    v = make_village(8, 0.4, seed=0)
+    v = make_village(8, seed=0)
     w = load_village(v.save(tmp_path / "v"))
-    assert w.n == 8 and len(w.demand) == 24
-    assert np.allclose(v.hourly_balance().net_deficit_kw, w.hourly_balance().net_deficit_kw)
+    assert w.n == 8 and len(w.forecast) == 24
+    assert np.allclose(v.hourly_balance().shortfall_kw, w.hourly_balance().shortfall_kw)
 
 
-def test_village_deficit_is_demand_minus_renewables():
+def test_village_shortfall_is_demand_minus_renewables():
     from gridq.data import make_village
 
-    v = make_village(8, 0.4, seed=1)
+    v = make_village(8, seed=1)
     b = v.hourly_balance()
-    assert np.allclose(b.net_deficit_kw, (b.demand_kw - b.solar_kw - b.wind_kw).round(2), atol=0.02)
+    assert np.allclose(b.shortfall_kw, (b.demand_kw - b.solar_kw - b.wind_kw).round(2), atol=0.02)
     assert b.coverable.all()  # sized so every hour can be covered
-    peak = int(b.loc[b.net_deficit_kw.idxmax(), "hour"])
+    peak = int(b.loc[b.shortfall_kw.idxmax(), "hour"])
     assert 17 <= peak <= 21  # evening peak
     g = v.microgrid(peak)
-    assert g.n == 8 and np.isclose(g.deficit, round(b.net_deficit_kw.max(), 1))
+    assert g.n == 8 and np.isclose(g.deficit, round(b.shortfall_kw.max(), 1))
 
 
 def test_shipped_village_files_load():
@@ -137,7 +147,7 @@ def test_shipped_village_files_load():
     from gridq.data import load_village
 
     root = Path(__file__).resolve().parents[1] / "data" / "villages"
-    folders = [p for p in root.iterdir() if (p / "sites.csv").exists()]
+    folders = [p for p in root.iterdir() if (p / "providers.csv").exists()]
     assert folders
     for f in folders:
         v = load_village(f)

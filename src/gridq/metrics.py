@@ -19,8 +19,6 @@ def dispatch_metrics(grid: Microgrid, x: np.ndarray) -> dict:
     x = np.asarray(x, dtype=float)
     supplied = float(grid.power @ x)
     served = min(supplied, grid.deficit)
-    overloaded = [e for e, s in grid.line_stress.items() if s > 0 and x[e[0]] and x[e[1]]]
-    crit = grid.priority > 0
     return {
         "supplied_kw": round(supplied, 2),
         "deficit_kw": grid.deficit,
@@ -28,8 +26,6 @@ def dispatch_metrics(grid: Microgrid, x: np.ndarray) -> dict:
         "surplus_kw": round(max(0.0, supplied - grid.deficit), 2),
         "cost_inr": round(float(grid.cost @ x), 1),
         "assets_on": int(x.sum()),
-        "critical_assets_on": int(x[crit].sum()),
-        "overloaded_lines": len(overloaded),
     }
 
 

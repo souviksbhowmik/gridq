@@ -7,10 +7,10 @@
 Experiments
   correctness  all solvers vs exact constrained optimum, n = 6/8/10, many seeds
   depth        QAOA quality vs p = 1..5 (INTERP warm start)
-  density      QAOA convergence + quality + transpiled 2q depth vs graph density
+  density      QAOA convergence, quality and 2q depth vs problem-graph density (sparsified QUBO)
   scaling      runtime and quality vs n = 6..12, all solvers
   noise        ideal vs fake-Heron noise model, p = 1..3
-  day          24-h dispatch of data/villages/village_n8_s0 (per-site demand - solar - wind)
+  day          24-h dispatch of data/villages/village_n8_s0 (village demand - solar - wind)
 """
 
 from __future__ import annotations
@@ -80,7 +80,7 @@ def solve_all(q, reps=3, include_qaoa=True, shots=256):
         x = repair(g, x)
         m = dispatch_metrics(g, x)
         rows.append(dict(
-            solver=name, n=g.n, density=round(g.density, 2), seed=g.seed,
+            solver=name, n=g.n, seed=g.seed,
             quality=quality(g, x, q.weights), optimal=bool(np.array_equal(x, exact.x)),
             cost_inr=m["cost_inr"], demand_met_pct=m["demand_met_pct"],
             cost_saved_pct=cost_saved_pct(g, x), runtime_s=rt, enrichment=enrich.get(name, np.nan),
@@ -92,7 +92,7 @@ def exp_correctness(seeds):
     rows = []
     for n in (6, 8, 10):
         for s in seeds:
-            rows += solve_all(build_qubo(make_microgrid(n, 0.4, seed=s)))
+            rows += solve_all(build_qubo(make_microgrid(n, seed=s)))
     df = pd.DataFrame(rows)
     df.to_csv(OUT / "correctness.csv", index=False)
     summ = df.groupby(["solver", "n"]).agg(
@@ -108,7 +108,7 @@ def exp_correctness(seeds):
 def exp_depth(seeds, max_p=5):
     rows = []
     for s in seeds:
-        q = build_qubo(make_microgrid(8, 0.4, seed=s))
+        q = build_qubo(make_microgrid(8, seed=s))
         exact = constrained_optimum(q).x
         for r in depth_sweep(q, max_reps=max_p):
             rows.append(dict(seed=s, p=r.reps, p_optimal=r.p_optimal, p_near=r.p_near_optimal, enrichment=r.enrichment,
@@ -131,33 +131,61 @@ def exp_depth(seeds, max_p=5):
     return df
 
 
-def exp_density(seeds, n_values=(8, 10), densities=(0.2, 0.35, 0.5, 0.7, 0.9)):
+def exp_density(seeds, n_values=(8, 10), keeps=(0.2, 0.4, 0.6, 0.8, 1.0), reps=2):
+    """Convergence vs problem-graph density.
+
+    The full QUBO couples every pair of assets (density 1). We keep only the
+    strongest `keep` share of couplings, train QAOA on that sparser problem, and
+    measure: optimiser evaluations to converge, enrichment of the TRUE optimum,
+    whether the sparse model's own optimum is still the true one, and the
+    transpiled two-qubit depth.
+    """
+    from gridq import problem_graph_density, sparsify_qubo
+    from gridq.qaoa import _bind, build_ansatz, fast_qaoa_probs, ising_diagonal, optimise_parameters
+    from gridq.qubo import energy_landscape
+    from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+    pm = generate_preset_pass_manager(optimization_level=3, basis_gates=["rz", "sx", "x", "cx"], seed_transpiler=0)
     rows = []
     for n in n_values:
-        for d in densities:
-            for s in seeds:
-                q = build_qubo(make_microgrid(n, d, seed=s))
-                r = solve_qaoa(q, reps=2)
-                exact = constrained_optimum(q).x
-                hist = np.array(r.history)
-                # iterations until within 1% of the final objective value
-                conv = int(np.argmax(hist <= hist[-1] + 0.01 * max(hist[0] - hist[-1], 1e-9)))
-                rows.append(dict(n=n, density=d, seed=s, edges=q.grid.graph.number_of_edges(),
-                                 p_optimal=r.p_optimal, enrichment=r.enrichment, final_obj=r.history[-1], iters_to_converge=conv,
-                                 evals=r.n_evals, found_opt=bool(np.array_equal(r.repaired_x, exact)),
-                                 two_q_gates=r.circuit_stats["two_qubit_gates"],
-                                 two_q_depth=r.circuit_stats["two_qubit_depth"]))
+        for s in seeds:
+            q = build_qubo(make_microgrid(n, seed=s))
+            full = energy_landscape(q)
+            gs = np.isclose(full, full.min())
+            for keep in keeps:
+                qs = sparsify_qubo(q, keep)
+                params, hist, nev = optimise_parameters(qs, reps, alpha=0.25, maxiter=1000)
+                probs = fast_qaoa_probs(ising_diagonal(qs), n, params)
+                ansatz, _ = build_ansatz(qs, reps)
+                circ = _bind(ansatz, params)
+                circ.measure_all()
+                isa = pm.run(circ)
+                rows.append(dict(
+                    n=n, seed=s, keep=keep, density=round(problem_graph_density(qs), 3),
+                    couplings=int(np.count_nonzero(qs.Q[np.triu_indices(n, 1)])),
+                    evals_to_converge=nev, enrichment=float(probs[gs].sum() * gs.size / gs.sum()),
+                    sparse_opt_is_true_opt=bool(np.argmin(energy_landscape(qs)) == np.argmin(full)),
+                    two_q_gates=int(sum(v for k, v in isa.count_ops().items() if k in ("cx", "cz", "ecr"))),
+                    two_q_depth=isa.depth(lambda i: i.operation.num_qubits == 2),
+                ))
     df = pd.DataFrame(rows)
     df.to_csv(OUT / "density_sweep.csv", index=False)
-    agg = df.groupby(["n", "density"]).mean(numeric_only=True).reset_index()
-    fig, ax = plt.subplots(1, 3, figsize=(14, 3.8))
+    agg = df.groupby(["n", "keep"]).agg(
+        density=("density", "mean"), couplings=("couplings", "mean"), evals=("evals_to_converge", "mean"),
+        enrichment=("enrichment", "median"), model_exact=("sparse_opt_is_true_opt", "mean"),
+        two_q_depth=("two_q_depth", "mean"),
+    ).reset_index()
+    fig, ax = plt.subplots(1, 4, figsize=(17, 3.8))
     for n, sub in agg.groupby("n"):
-        ax[0].plot(sub.density, sub.iters_to_converge, "o-", label=f"n={n}")
-        ax[1].plot(sub.density, sub.enrichment, "o-", label=f"n={n}")
-        ax[2].plot(sub.density, sub.two_q_depth, "o-", label=f"n={n}")
-    ax[0].set(xlabel="graph density", ylabel="COBYLA iterations", title="Convergence vs density")
-    ax[1].set(xlabel="graph density", ylabel="enrichment vs random, p=2", title="Quality vs density")
-    ax[2].set(xlabel="graph density", ylabel="2-qubit depth", title="Circuit cost vs density")
+        ax[0].plot(sub.density, sub.evals, "o-", label=f"n={n}")
+        ax[1].plot(sub.density, sub.two_q_depth, "o-", label=f"n={n}")
+        ax[2].plot(sub.density, sub.enrichment, "o-", label=f"n={n}")
+        ax[3].plot(sub.density, 100 * sub.model_exact, "o-", label=f"n={n}")
+    ax[0].set(xlabel="problem-graph density", ylabel="optimiser evaluations", title="Convergence vs density")
+    ax[1].set(xlabel="problem-graph density", ylabel="2-qubit depth", title="Circuit cost vs density")
+    ax[2].set(xlabel="problem-graph density", ylabel="median enrichment of true optimum", title="Quality vs density")
+    ax[2].axhline(1, ls="--", c="grey")
+    ax[3].set(xlabel="problem-graph density", ylabel="% instances", title="Sparse model still has the true optimum")
     for a in ax:
         a.legend()
     fig.tight_layout()
@@ -170,7 +198,7 @@ def exp_scaling(seeds, n_values=(6, 8, 10, 12)):
     rows = []
     for n in n_values:
         for s in seeds:
-            rows += solve_all(build_qubo(make_microgrid(n, 0.4, seed=s)))
+            rows += solve_all(build_qubo(make_microgrid(n, seed=s)))
     df = pd.DataFrame(rows)
     df.to_csv(OUT / "scaling.csv", index=False)
     agg = df.groupby(["solver", "n"]).agg(quality=("quality", "mean"), runtime_s=("runtime_s", "mean")).reset_index()
@@ -194,7 +222,7 @@ def exp_noise(seeds, max_p=3):
     pm = backend_pass_manager(backend)
     rows = []
     for s in seeds:
-        q = build_qubo(make_microgrid(6, 0.4, seed=s))
+        q = build_qubo(make_microgrid(6, seed=s))
         for p in range(1, max_p + 1):
             for label, sampler, pmgr in (("ideal", None, None), (f"noisy:{backend.name}", noisy_sampler(backend, seed=s), pm)):
                 r = solve_qaoa(q, reps=p, sampler=sampler, pass_manager=pmgr, backend_name=label)
@@ -228,8 +256,8 @@ def exp_day(village="village_n8_s0"):
     rows = []
     for h, r in bal.iterrows():
         if not (r.dispatch_needed and r.coverable):
-            rows.append(dict(hour=h, deficit_kw=max(float(r.net_deficit_kw), 0.0), solver="none_needed",
-                             cost_inr=0.0, naive_cost_inr=0.0, demand_met_pct=100.0, overloaded_lines=0))
+            rows.append(dict(hour=h, deficit_kw=max(float(r.shortfall_kw), 0.0), solver="none_needed",
+                             cost_inr=0.0, naive_cost_inr=0.0, demand_met_pct=100.0))
             continue
         g = v.microgrid(int(h))
         q = build_qubo(g)
@@ -238,12 +266,10 @@ def exp_day(village="village_n8_s0"):
             x = repair(g, x)
             m = dispatch_metrics(g, x)
             rows.append(dict(hour=h, deficit_kw=g.deficit, solver=name, cost_inr=m["cost_inr"],
-                             naive_cost_inr=naive_policy_cost(g), demand_met_pct=m["demand_met_pct"],
-                             overloaded_lines=m["overloaded_lines"]))
+                             naive_cost_inr=naive_policy_cost(g), demand_met_pct=m["demand_met_pct"]))
     df = pd.DataFrame(rows)
     df.to_csv(OUT / "deployment_day.csv", index=False)
-    tot = df[df.solver != "none_needed"].groupby("solver")[["cost_inr", "naive_cost_inr", "overloaded_lines"]].sum()
-    tot = tot.rename(columns={"overloaded_lines": "line_overload_hours"})
+    tot = df[df.solver != "none_needed"].groupby("solver")[["cost_inr", "naive_cost_inr"]].sum()
     tot["saved_pct"] = (100 * (1 - tot.cost_inr / tot.naive_cost_inr)).round(1)
     tot.to_csv(OUT / "deployment_day_summary.csv")
     print(f"village: {village}")

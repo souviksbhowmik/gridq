@@ -1,0 +1,9 @@
+provider_id,site_name,site_type,provider_type,capacity_kw,price_inr_per_kwh
+0,Household 0,household,diesel,6.5,26.738
+1,School 1,school,battery,4.8,4.771
+2,Household 2,household,battery,2.1,6.524
+3,Water Pump 3,water_pump,demand_response,2.1,12.048
+4,Household 4,household,diesel,5.8,26.086
+5,Clinic 5,clinic,battery,2.2,6.273
+6,Cold Store 6,cold_store,diesel,6.6,23.182
+7,Household 7,household,demand_response,2.7,13.296

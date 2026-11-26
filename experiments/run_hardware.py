@@ -55,14 +55,13 @@ def summarise(qubo, counts):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=6)
-    ap.add_argument("--density", type=float, default=0.4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--shots", type=int, default=4096)
     ap.add_argument("--dry-run", action="store_true", help="transpile and report, do not submit")
     args = ap.parse_args()
 
-    qubo = build_qubo(make_microgrid(args.n, args.density, seed=args.seed))
+    qubo = build_qubo(make_microgrid(args.n, seed=args.seed))
     params, _, _ = optimise_parameters(qubo, args.reps, alpha=0.25)
     ansatz, _ = build_ansatz(qubo, args.reps)
     circ = _bind(ansatz, params)

@@ -2,10 +2,10 @@
 
 **IBM Qiskit Fall Fest 2026 · 48-Hour Quantum for Humanity Hackathon · Track 2: Climate, Energy & Agriculture**
 
-> At 19:00 the sun sets and village demand peaks: lights, the clinic's vaccine fridge, the water pump.
+> At 19:00 the sun sets and village demand peaks: lights, cooking, fridges, the water pump.
 > The microgrid operator must choose which flexible assets to switch on (batteries, a diesel genset,
-> demand-response contracts) to cover the shortfall **at the lowest cost, without overloading shared
-> lines, and keeping critical sites powered**. Today that is done by rule of thumb, and the fallback
+> demand-response contracts) to cover the shortfall **at the lowest cost**. Today that is done by
+> rule of thumb, and the fallback
 > is "run the diesel". GridQ formulates the decision as a QUBO, solves it with QAOA on Qiskit Runtime
 > primitives, and benchmarks the result honestly against classical solvers.
 
@@ -21,40 +21,38 @@
 |---|---|
 | Who benefits | Rural communities on solar/wind/battery microgrids, and the small operators who run them |
 | Decision | For one dispatch interval: which of the *n* flexible assets (6–12) to switch on |
-| Constraints | Supply ≥ deficit; shared feeder lines have a thermal capacity |
-| Objective | Minimise running cost (₹), prefer supplying critical loads (clinic, water pump, cold store) |
+| Constraint | Supply ≥ deficit. The village is one shared pool, so every source can serve the deficit (no line limits) |
+| Objective | Minimise running cost (₹) |
 | Data | **100% synthetic** village master data in [`data/villages/`](data/villages/) (see §1.1). No real customer or utility data |
 
 ### 1.1 Village master data (`data/villages/<village>/`)
 
-Every village is a folder of plain CSV files that you can open in Excel or edit by hand:
+Every village is a folder of two plain CSV files that you can open in Excel or edit by hand:
 
 | File | Contents |
 |---|---|
-| `sites.csv` | One row per site: `site_name`, `site_type` (household / school / clinic / water pump / cold store), `critical`, `peak_demand_kw`, and its **flexible asset** (`asset` = battery / diesel / demand_response, `asset_kw`, `price_inr_per_kwh`) |
-| `lines.csv` | Distribution lines between sites and their `capacity_kw` |
-| `site_demand.csv` | Hourly demand of **each site** (24 rows), built from a load shape per site type: households peak in the evening, the school by day, the clinic around the clock, and so on |
-| `renewables.csv` | Hourly village solar and wind output (kW) |
+| `forecast.csv` | 24-hour **village** forecast: total `demand_kw`, `solar_kw` and `wind_kw`. The demand curve is synthetic, built from typical daily patterns: an evening peak from homes, daytime load from the school and clinic, pumping morning and evening |
+| `providers.csv` | One row per **flexible provider**: `site_name`, `site_type`, `provider_type` (battery / diesel / demand_response), `capacity_kw`, `price_inr_per_kwh` |
 | `village.json` | Name, seed and notes |
 
-For each hour: **village deficit = Σ site demand − solar − wind**. That deficit is what the flexible assets must cover. Shipped villages: `village_n6_s0`, `village_n8_s0` (the demo), `village_n8_s1`, `village_n10_s0` and `village_n12_s0`. Regenerate them with `python scripts/export_villages.py`, or edit the CSVs to use your own figures. The dashboard reads whatever is in the folder.
+For each hour: **shortfall = village demand − solar − wind**. The providers must cover it. All providers feed one shared village pool, so any of them can serve the shortfall, and demand response counts the same as supply. Shipped villages: `village_n6_s0`, `village_n8_s0` (the demo), `village_n8_s1`, `village_n10_s0` and `village_n12_s0`. Regenerate them with `python scripts/export_villages.py`, or edit the CSVs to use your own figures. The dashboard reads whatever is in the folder.
 
-The benchmark experiments (§4.1–4.4) use many randomly generated instances (`make_microgrid(n, density, seed)`) with the same assets. In those, the deficit is set to 45% of total flexible capacity, so every instance is equally hard.
+The benchmark experiments (§4.1–4.4) use many randomly generated instances (`make_microgrid(n, seed)`) with the same assets. In those, the deficit is set to 45% of total flexible capacity, so every instance is equally hard.
 
 ## 2. QUBO formulation (`src/gridq/qubo.py`)
 
-One binary variable per asset, so **one qubit per node**.
+One binary variable per flexible source, so **one qubit per site**. Every source, including demand response (cutting use counts the same as adding supply), feeds one shared village pool.
 
 $$
-H(x)=A\Big(\sum_i \tfrac{p_i}{D}\,x_i-1\Big)^2+\sum_i \tilde c_i\,x_i+B\!\!\sum_{(i,j)\in E}\! w_{ij}\,x_ix_j-C\sum_i r_i\,x_i
+H(x)=A\Big(\sum_i \tfrac{p_i}{D}\,x_i-1\Big)^2+\sum_i \tilde c_i\,x_i
 $$
 
 | Term | Meaning | Weight |
 |---|---|---|
-| balance | injected power $p_i$ should cover the deficit $D$ | A = 20 |
-| cost | normalised running cost $\tilde c_i$ | 1 |
-| line overload | $w_{ij} = \max(0,\,p_i+p_j-\text{cap}_{ij})/D$: penalises neighbours whose joint injection exceeds the line capacity | B = 1 |
-| critical loads | $r_i = 1$ if the asset sits at a clinic, water pump or cold store | C = 0.04 |
+| balance | switched-on power $p_i$ should cover the village deficit $D$ | A = 20 |
+| cost | normalised running cost $\tilde c_i$ (all costs sum to 1) | 1 |
+
+This is a **minimum-cost covering (knapsack-type) problem**. Expanding the squared balance term creates a coupling $2A\,p_ip_j/D^2$ between *every* pair of sources, so the QUBO's problem graph is complete. That is the starting point for the density study in §4.3.
 
 The QUBO is built as a `qiskit_optimization.QuadraticProgram`, converted to an Ising `SparsePauliOp`, and normalised so QAOA angles transfer across instances.
 
@@ -81,7 +79,7 @@ The QUBO is built as a `qiskit_optimization.QuadraticProgram`, converted to an I
 
 ## 4. Results
 
-Reproduce with `python experiments/run_benchmarks.py` (≈ 4 min on a laptop). 10 random instances per setting, edge density 0.4 unless stated. Raw CSVs and plots are in [`results/`](results/).
+Reproduce with `python experiments/run_benchmarks.py` (≈ 4 min on a laptop). 10 random instances per setting. Raw CSVs and plots are in [`results/`](results/).
 
 ### 4.1 Solver comparison (`results/comparison_table.csv`)
 
@@ -89,14 +87,14 @@ Reproduce with `python experiments/run_benchmarks.py` (≈ 4 min on a laptop). 1
 
 | Solver | n = 6 quality / optimal | n = 8 | n = 10 | n = 12 quality | saved (n = 8) | runtime (n = 10) |
 |---|---|---|---|---|---|---|
-| Exact | 1.000 / 100% | 1.000 / 100% | 1.000 / 100% | 1.000 | 59.9% | **0.1 ms** |
-| **QAOA p = 3** (ideal, 256 shots) | 1.000 / 100% | 1.000 / 100% | 1.000 / 100% | 1.000 | 59.9% | 496 ms |
-| Random sampling (256 shots) | 1.000 / 100% | 1.000 / 100% | 1.000 / 100% | 1.000 | 59.9% | 19 ms |
-| Simulated annealing | 0.983 / 80% | 0.958 / 40% | 0.959 / 10% | 0.981 | 58.0% | 46 ms |
-| Operator rule | 0.938 / 40% | 0.959 / 30% | 0.958 / 30% | 0.949 | 59.0%* | 0.01 ms |
-| Greedy descent | 0.700 / 10% | 0.667 / 0% | 0.638 / 0% | 0.661 | 25.4% | 0.05 ms |
+| Exact | 1.000 / 100% | 1.000 / 100% | 1.000 / 100% | 1.000 | 60.8% | **0.05 ms** |
+| **QAOA p = 3** (ideal, 256 shots) | 1.000 / 100% | 1.000 / 100% | 1.000 / 100% | 1.000 | 60.8% | 488 ms |
+| Random sampling (256 shots) | 1.000 / 100% | 1.000 / 100% | 1.000 / 100% | 1.000 | 60.8% | 4 ms |
+| Operator rule (cheapest per kW first) | 0.994 / 80% | 0.981 / 50% | 0.995 / 80% | 0.994 | 59.1% | 0.02 ms |
+| Simulated annealing | 0.968 / 60% | 0.956 / 20% | 0.944 / 40% | 0.961 | 56.9% | 46 ms |
+| Greedy descent | 0.697 / 10% | 0.618 / 0% | 0.611 / 0% | 0.523 | 27.5% | 0.05 ms |
 
-\* The operator rule sometimes saves *more* rupees than the optimum because it ignores the critical-load preference. Its quality score is lower because it gets the trade-off wrong.
+Without line limits, the problem is a pure minimum-cost covering problem, and the operator's cheapest-per-kW rule is already a strong heuristic (98–99% quality). It misses the optimum when a slightly dearer but better-sized combination fits the deficit more tightly.
 
 ### 4.2 Does the quantum circuit help? Enrichment vs depth (`results/depth_sweep.png`)
 
@@ -104,79 +102,92 @@ The **enrichment** is P(sampling the optimal dispatch) ÷ P(random guess).
 
 | p | 1 | 2 | 3 | 4 | 5 |
 |---|---|---|---|---|---|
-| enrichment (n = 8, ideal) | 2.2× | 3.8× | 5.1× | 6.4× | 7.0× |
+| enrichment (n = 8, ideal) | 2.4× | 3.5× | 4.6× | 5.5× | 6.0× |
 | 2-qubit depth (generic transpile) | 26 | 42 | 58 | 74 | 90 |
 
-CVaR(α = 0.25) gives about 40–50% more enrichment than the plain expectation value at the same depth. We measured 3.8× vs 2.65× at n = 8, p = 2, and 5.2× vs 3.6× at n = 12, p = 3.
+CVaR(α = 0.25) gives about 20–40% more enrichment than the plain expectation value at the same depth. We measured 3.5× vs 2.5× at n = 8, p = 2, and 3.8× vs 3.2× at n = 12, p = 3.
 
-### 4.3 Convergence vs graph density (`results/density_sweep.png`)
+### 4.3 Convergence vs problem-graph density (`results/density_sweep.png`)
 
-| density | 0.2 | 0.35 | 0.5 | 0.7 | 0.9 |
+The village is one shared pool, so there is no physical line graph. "Graph density" here means the **QUBO's problem graph**: one node per qubit, and one edge per non-zero coupling $Q_{ij}$. Each edge becomes a two-qubit ZZ gate in every QAOA layer. The full balance term couples every pair, so the full graph has density 1.0.
+
+To study density, we **keep only the strongest k% of couplings** (`gridq.sparsify_qubo`), train QAOA (p = 2, CVaR, up to 1,000 COBYLA evaluations) on that sparser model, and score it against the **true** optimum. 10 instances per point; enrichment is the median.
+
+| problem-graph density | 0.2 | 0.4 | 0.6 | 0.8 | 1.0 (full) |
 |---|---|---|---|---|---|
-| enrichment, n = 8 (p = 2) | 3.8× | 3.8× | 4.0× | 4.1× | 4.0× |
-| enrichment, n = 10 (p = 2) | 3.7× | 3.7× | 3.7× | 4.2× | 4.5× |
-| 2-qubit depth, n = 8 / n = 10 | 42 / 54 | 42 / 54 | 42 / 54 | 42 / 54 | 42 / 54 |
+| couplings kept, n = 8 / n = 10 | 6 / 9 | 11 / 18 | 17 / 27 | 22 / 36 | 28 / 45 |
+| **optimiser evaluations to converge**, n = 8 | 35 | 31 | 63 | 161 | **841** |
+| optimiser evaluations to converge, n = 10 | 25 | 56 | 64 | 150 | **899** |
+| 2-qubit depth, n = 8 / n = 10 | 20 / 26 | 28 / 38 | 36 / 47 | 40 / 52 | 42 / 54 |
+| sparse model's optimum = true optimum (n = 8 / n = 10) | 0% / 0% | 0% / 0% | 10% / 0% | 40% / 30% | 100% / 100% |
+| enrichment of true optimum, n = 8 | 0.4× | 1.4× | 5.7× | 7.2× | 3.3× |
+| enrichment of true optimum, n = 10 | 0.01× | 0.06× | 0.12× | 0.26× | 3.8× |
 
-**Finding:** the **balance penalty couples every pair of assets**, so the QUBO is all-to-all whatever the grid density. Circuit cost depends on *n*, not on line density. Density only changes coefficients, and QAOA quality is roughly flat to slightly better on denser grids. A sparser formulation, such as regional sub-balances, is the main lever for making circuits shallower.
+**Findings**
+- **Convergence slows sharply with density.** Optimiser evaluations rise from about 30 at density 0.2–0.4 to about 850 at full density, roughly 25× more. Sparse problem graphs give smoother landscapes that COBYLA settles quickly.
+- **Circuit cost rises with density.** Two-qubit depth goes from 20 to 42 at n = 8, and from 26 to 54 at n = 10. On noisy hardware, that is the main reason to want sparser graphs.
+- **The balance constraint is truly all-to-all.** Dropping couplings changes which dispatch is optimal. Below density 0.6 the sparse model almost never has the true optimum, and at n = 10 even density 0.8 points QAOA at the wrong answer (0.26×, worse than random). Only the full graph reliably targets the true optimum (3.3–3.8×).
+- At n = 8, densities 0.6–0.8 show high enrichment for the true optimum on some instances. That is luck, not design: the sparse optimum is a near neighbour of the true one. It does not carry over to n = 10.
+- **Conclusion:** this problem cannot be made cheaper for QAOA by simply sparsifying. Lower depth would need a reformulation (for example, splitting the village into sub-pools with their own balance terms), and that trades optimality for circuit size.
 
 ### 4.4 Noise (`results/noise.png`): ideal vs IBM Heron noise model, n = 6
 
 | p | ideal enrichment | noisy enrichment | 2q gates ideal → on-device |
 |---|---|---|---|
-| 1 | 2.21× | 1.99× | 30 → 53 |
-| 2 | 2.80× | 2.15× | 60 → 105 |
-| 3 | 2.97× | 2.23× | 90 → 167 |
+| 1 | 2.15× | 1.97× | 30 → 53 |
+| 2 | 2.77× | 2.14× | 60 → 105 |
+| 3 | 2.92× | 2.23× | 90 → 167 |
 
 Routing onto the heavy-hex topology adds SWAPs and roughly doubles the 2-qubit gate count. **Under noise, gains beyond p = 2 almost disappear.** Deeper circuits add as much error as they remove.
 
-### 4.5 Real IBM Quantum hardware: `ibm_fez` (Heron r2), n = 6, p = 2
+### 4.5 Real IBM Quantum hardware: `ibm_kingston` (Heron r2), n = 6, p = 2
 
-The same trained circuit, the same instance (seed 0) and 4,096 shots per run. Run on 25 Nov 2026. The raw counts and job IDs are in [`results/hardware_ibm_fez_n6_p2_s0.json`](results/hardware_ibm_fez_n6_p2_s0.json).
+Instance `make_microgrid(6, seed=0)`: 6 providers, shortfall 11.6 kW. 4,096 shots per run, 26 Nov 2026, on the current model. Raw counts and job IDs are in [`results/hardware_ibm_kingston_n6_p2_s0.json`](results/hardware_ibm_kingston_n6_p2_s0.json).
 
 | Run | P(optimal) ± 1σ | Enrichment vs random | ⟨H⟩ | Fidelity to ideal distribution | Optimal dispatch found? |
 |---|---|---|---|---|---|
-| Ideal (exact simulation) | 0.045 ± 0.003 | 2.86× | 2.10 | 1.000 | ✔ |
-| FakeFez noise model | 0.037 ± 0.003 | 2.38× | 2.71 | 0.956 | ✔ |
-| **ibm_fez, unmitigated** (`dc3906dhdvas73bndf2g`) | **0.042 ± 0.003** | **2.70×** | 2.70 | 0.937 | ✔ |
-| ibm_fez, mitigated: DD + gate/measure twirling (`dc3907inj2vs73dhsdl0`) | 0.029 ± 0.003 | 1.88× | 3.26 | 0.906 | ✔ |
-| Uniform random guessing | 0.016 | 1.00× | 5.35 | 0.733 | n/a |
+| Ideal (exact simulation) | 0.044 ± 0.003 | 2.82× | 2.06 | 1.000 | ✔ |
+| FakeFez noise model (Heron r2 snapshot) | 0.037 ± 0.003 | 2.38× | 2.56 | 0.960 | ✔ |
+| **ibm_kingston, unmitigated** (`dc3tgfds2omc738e88hg`) | **0.037 ± 0.003** | **2.38×** | 2.61 | 0.932 | ✔ |
+| ibm_kingston, mitigated: DD + gate/measure twirling (`dc3tgh6q4uuc73a7l03g`) | 0.029 ± 0.003 | 1.86× | 2.91 | 0.935 | ✔ |
+| Uniform random guessing | 0.016 | 1.00× | 5.31 | 0.729 | n/a |
 
-Transpiled for `ibm_fez`: 105 two-qubit gates, two-qubit depth 77, total depth 250.
+Transpiled for `ibm_kingston`: 105 two-qubit gates, two-qubit depth 77, total depth 252. Both runs returned the optimal dispatch: providers {2, 3, 4}, 12.0 kW for ₹61.5, 100% of demand met.
 
 **Findings**
-- **Real hardware keeps most of the quantum signal.** Unmitigated `ibm_fez` reaches 2.70× enrichment, which is 94% of the ideal 2.86×. Its energy matches the noise model almost exactly (⟨H⟩ 2.70 vs 2.71). The `FakeFez` snapshot predicted the device's degradation well, and if anything it was slightly pessimistic about P(optimal).
-- **Every run returned the optimal dispatch.** That is ₹69.7 for 11.9 kW against an 11.6 kW deficit, with 100% of demand met and no line overloads.
-- **The "mitigated" run was worse, and the gap is statistically significant** (z = 3.2). Dynamical decoupling and twirling *suppress* coherent errors but do not *correct* sampled distributions. Twirling turns coherent errors into incoherent (depolarising-like) noise, which flattens the output distribution towards uniform. For a sampling algorithm like QAOA, where the useful signal is a skewed distribution, that hurts. These options pay off mainly for **expectation values** with an Estimator (for example ZNE, PEC or TREX).
+- **Real hardware keeps most of the quantum signal.** Unmitigated `ibm_kingston` reaches 2.38× enrichment, 84% of the ideal 2.82×.
+- **The noise model predicted the device almost exactly.** The `FakeFez` simulation gave the same P(optimal) (0.037 vs 0.037) and nearly the same energy (2.56 vs 2.61). A snapshot of a sister Heron r2 device is a reliable stand-in for planning hardware runs.
+- **Error mitigation made things worse, on two different devices.** DD + twirling lowered enrichment from 2.38× to 1.86× (z = 2.0). We saw the same on `ibm_fez` in an earlier run (2.70× → 1.88×, z = 3.2; [`results/hardware_ibm_fez_n6_p2_s0_v1_with_lines.json`](results/hardware_ibm_fez_n6_p2_s0_v1_with_lines.json), made with an earlier model version that had line limits). Twirling turns coherent errors into random noise, which flattens the output distribution towards uniform. For a sampling algorithm like QAOA, where the useful signal is a skewed distribution, that hurts. These options pay off mainly for **expectation values** with an Estimator (for example ZNE, PEC or TREX).
 
   Our lesson: *benchmark mitigation, don't assume it.* Next steps would be DD-only without twirling, and readout-error mitigation on the counts (for example M3).
 - **Honest caveat:** this is one instance and one run per setting, at n = 6. At this size, random sampling with the same shot budget also finds the optimum after repair (§5).
 
 ### 4.6 Deployment day (`results/deployment_day_summary.csv`)
 
-We dispatched the village in [`data/villages/village_n8_s0/`](data/villages/village_n8_s0/) hour by hour for 24 hours. Each hour's deficit = Σ site demand − solar − wind, taken from the master-data files. Renewables cover 09:00–16:00, and the other 15 hours need dispatch, peaking at 17.6 kW at 19:00.
+We dispatched the village in [`data/villages/village_n8_s0/`](data/villages/village_n8_s0/) hour by hour for 24 hours. Each hour's shortfall = village demand − solar − wind, from `forecast.csv`. Renewables cover 09:00–16:00, and the other 15 hours need dispatch, peaking at 17.6 kW at 19:00.
 
-| Policy | Daily cost | Saved vs diesel-first | Line-overload hours |
-|---|---|---|---|
-| Diesel-first (status quo) | ₹4,898 | n/a | n/a |
-| Operator rule | ₹2,193 | 55.2% | 0 |
-| **QAOA p = 3** | **₹2,036** | **58.4%** | **0** |
-| Exact optimum | ₹2,036 | 58.4% | 0 |
+| Policy | Daily cost | Saved vs diesel-first |
+|---|---|---|
+| Diesel-first (status quo) | ₹4,898 | n/a |
+| Operator rule (cheapest per kW first) | ₹2,123 | 56.7% |
+| **QAOA p = 3** | **₹1,913** | **60.9%** |
+| Exact optimum | ₹1,913 | 60.9% |
 
-QAOA matched the exact optimum in every hour. It beats the operator's cheapest-first rule by about ₹157 a day (7%). Most of the value comes from **optimising at all**, rather than running diesel by default.
+QAOA matched the exact optimum in every hour. It beats the operator's cheapest-first rule by about ₹210 a day (10%). Most of the value comes from **optimising at all**, rather than running diesel by default.
 
 ## 5. Honest assessment and limitations
 
 - **Classical wins at this size.** For ≤ 12 assets, brute force is exact in under 1 ms. We make **no quantum-advantage claim**.
-- **QAOA's signal is real but not yet decisive.** It concentrates probability on the optimum (2–7× over random, rising with p). But with 256 shots and the same repair step, **random sampling also finds the optimum** at n ≤ 12, because the search space is so small.
-- **Noise caps useful depth at p ≈ 2** on today's devices for this problem. On real `ibm_fez` the unmitigated run kept 94% of the ideal enrichment; the twirling-based mitigation we tried made it worse (§4.5).
-- **Formulation gap.** The squared balance penalty plus repair can land up to 14% (mean 2.5%) of the feasible objective range away from the true optimum. Across 45 calibration instances it was exact 62% of the time (`tests/test_gridq.py`). Slack-variable encodings cost extra qubits. We tested them and they improved this only moderately.
-- **Hour by hour, not linked.** Each hour is optimised on its own. We do not carry battery state of charge from one hour to the next, or model AC power flow. Lines use a simple pairwise capacity model.
-- **Village-level balance.** Per-site demand is in the data and sums to the village deficit, but power is pooled on the shared grid. Critical sites get a priority bonus, not a guaranteed per-site supply.
+- **QAOA's signal is real but not yet decisive.** It concentrates probability on the optimum (2–6× over random, rising with p). But with 256 shots and the same repair step, **random sampling also finds the optimum** at n ≤ 12, because the search space is so small.
+- **Noise caps useful depth at p ≈ 2** on today's devices for this problem. On real `ibm_kingston` the unmitigated run kept 84% of the ideal enrichment, and the twirling-based mitigation we tried made it worse, as it did on `ibm_fez` (§4.5).
+- **Formulation gap.** The squared balance penalty plus repair can land up to 15% (mean 2.4%) of the feasible objective range away from the true optimum. Across 45 calibration instances it was exact 56% of the time (`tests/test_gridq.py`). Slack-variable encodings cost extra qubits. We tested them and they improved this only moderately.
+- **Hour by hour, not linked.** Each hour is optimised on its own. We do not carry battery state of charge from one hour to the next.
+- **One shared pool ("copper plate").** Demand is forecast for the village as a whole, and any provider can serve the shortfall. We do not model distribution-line limits or AC power flow, nor per-site supply guarantees (for example, protecting a clinic). These are natural next steps, but out of scope for this track.
 - **Synthetic data only**, as the rules require.
 
-**When could quantum matter?** District-scale grids (hundreds of assets with multi-period coupling) are beyond brute force, and heuristics there degrade. Getting there needs sparser formulations (lower circuit depth), better error mitigation, and eventually fault-tolerant hardware.
+**When could quantum matter?** District-scale grids (hundreds of assets with multi-period coupling) are beyond brute force, and heuristics there degrade. Getting there needs formulations with sparser problem graphs (our density study, §4.3, shows naive sparsification breaks the balance constraint), better error mitigation, and eventually fault-tolerant hardware.
 
-**Path to deployment.** The value delivered today is an *optimiser-in-the-loop* dispatch for community microgrid operators, saving about 58% vs diesel-first (and 7% vs the operator's rule of thumb) over our synthetic day. The solver backend is pluggable: classical today, quantum as hardware matures.
+**Path to deployment.** The value delivered today is an *optimiser-in-the-loop* dispatch for community microgrid operators, saving about 61% vs diesel-first (and 10% vs the operator's rule of thumb) over our synthetic day. The solver backend is pluggable: classical today, quantum as hardware matures.
 
 ## 6. How to run
 
@@ -193,7 +204,7 @@ python -m ipykernel install --user --name qff-gridq --display-name "Python (qff-
 ### 6.2 Run everything on simulators (no account needed)
 
 ```bash
-pytest -q                                   # 27 tests, ~2 s
+pytest -q                                   # 28 tests, ~2 s
 python experiments/run_benchmarks.py        # all 6 experiments → results/  (~4 min)
 python experiments/run_benchmarks.py --quick              # smoke test, 3 seeds
 python experiments/run_benchmarks.py --only density noise # selected experiments
@@ -204,14 +215,14 @@ python experiments/run_benchmarks.py --only density noise # selected experiments
 | Format | Command | Notes |
 |---|---|---|
 | Jupyter notebook | `jupyter notebook notebooks/demo.ipynb` | Choose kernel **Python (qff-gridq)**; *Run All* takes about 1 min |
-| Streamlit dashboard | `streamlit run app/streamlit_app.py` | Opens http://localhost:8501. Pick a village and an hour in the sidebar. Four tabs: **📋 Village master data** (sites, assets, lines) · **⚡ Demand & supply** (per-site demand, solar, wind, hourly deficit) · **🧮 Dispatch (one hour)** (QAOA vs classical; choose p, shots, ideal or noisy backend) · **📅 24-hour plan** (day cost vs diesel-first) |
+| Streamlit dashboard | `streamlit run app/streamlit_app.py` | Opens http://localhost:8501. Pick a village and an hour in the sidebar. Four tabs: **⚡ Demand & shortfall** (village demand forecast vs solar and wind, hourly shortfall) · **🔌 Providers** (capacity and price of each flexible provider) · **🧮 Dispatch & compare solvers** (run QAOA, exact, simulated annealing, greedy, greedy descent and random sampling side by side, with each solver's provider allocation, cost, gap to optimum, quality and runtime) · **📅 24-hour plan** (day cost vs diesel-first) |
 
 ### 6.4 Real IBM Quantum hardware (optional; uses credits)
 
 1. Sign in at **https://quantum.cloud.ibm.com** (free IBMid).
 2. **API key:** on the dashboard, click *Create API key*. It is shown only once, so copy it.
 3. **Instance CRN:** go to *Instances* and copy the CRN (`crn:v1:bluemix:...`). Use the hackathon-credit instance if you have been invited to one; otherwise use the free Open plan (about 10 min of QPU time per month, which is plenty).
-4. **Backend:** the *Compute resources* page lists your QPUs. Each QPU is a Qiskit backend. Our allocation is all Heron r2 with 156 qubits: `ibm_fez`, `ibm_kingston`, `ibm_marrakesh`. We use **`ibm_fez`**, because our noise-model results use `FakeFez`, a snapshot of the same device.
+4. **Backend:** the *Compute resources* page lists your QPUs. Each QPU is a Qiskit backend. Our allocation is all Heron r2 with 156 qubits: `ibm_fez`, `ibm_kingston`, `ibm_marrakesh`. Our current results use **`ibm_kingston`** (the least-busy QPU when `IBM_BACKEND` is empty); `FakeFez`, a Heron r2 snapshot, matched it closely.
 5. Fill in the git-ignored `.env` file:
 
    ```bash
@@ -229,7 +240,7 @@ python experiments/run_benchmarks.py --only density noise # selected experiments
    python experiments/run_hardware.py --dry-run          # free: checks credentials, prints transpiled depth
    python experiments/run_hardware.py --n 6 --reps 2     # submits 2 jobs: unmitigated + mitigated (DD + twirling)
    ```
-   Options: `--n` nodes (6–12), `--reps` QAOA layers, `--seed` scenario, `--density`, `--shots` (default 4096).
+   Options: `--n` nodes (6–12), `--reps` QAOA layers, `--seed` scenario, `--shots` (default 4096).
 
 Results are saved to `results/hardware_<backend>_n<n>_p<reps>_s<seed>.json`. Each file holds the job IDs, counts, enrichment, P(optimal), dispatch metrics and circuit stats. Following the rules, the script trains on the simulator first and only sends the final circuit to the QPU.
 
@@ -248,7 +259,7 @@ Results are saved to `results/hardware_<backend>_n<n>_p<reps>_s<seed>.json`. Eac
 
 ```
 src/gridq/        data.py (generator + Village master data) · qubo.py · classical.py · qaoa.py · metrics.py · hardware.py
-data/villages/    village master data (CSV): sites, lines, per-site demand, renewables
+data/villages/    village master data (CSV): providers.csv, forecast.csv
 scripts/          export_villages.py (regenerates data/villages)
 experiments/      run_benchmarks.py (6 experiments) · run_hardware.py
 .env.example      template for IBM credentials (copy to .env)
