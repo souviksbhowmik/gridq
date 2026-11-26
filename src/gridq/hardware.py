@@ -86,3 +86,86 @@ def fake_backend():
 
 def backend_pass_manager(backend, seed: int = 0):
     return generate_preset_pass_manager(optimization_level=3, backend=backend, seed_transpiler=seed)
+
+
+# ---------------------------------------------------------------------------
+# Saved hardware runs (results/hardware_*.json): scoring for reports/dashboard
+# ---------------------------------------------------------------------------
+
+def counts_to_probs(counts: dict, n: int):
+    """Qiskit counts -> probability vector indexed by basis state (bit i = provider i)."""
+    import numpy as np
+
+    p = np.zeros(2**n)
+    for bits, c in counts.items():
+        p[int(bits, 2)] += c
+    return p / p.sum()
+
+
+def score_hardware_run(path, noise_model: bool = True, seed: int = 0) -> dict:
+    """Re-score a saved hardware JSON against the current model.
+
+    Returns one row per setting (ideal, noise model, each hardware run,
+    random guessing) with P(optimal), enrichment, <H>, fidelity to the ideal
+    distribution, and the dispatch each run decodes to. The ideal and
+    noise-model rows use the same trained angles that were sent to the QPU.
+    """
+    import json
+
+    import numpy as np
+
+    from .classical import constrained_optimum, repair
+    from .data import make_microgrid
+    from .metrics import dispatch_metrics
+    from .qaoa import _bind, build_ansatz, fast_qaoa_probs, ising_diagonal
+    from .qubo import build_qubo, dispatch_objective, energy_landscape
+
+    d = json.loads(Path(path).read_text())
+    a = d["args"]
+    n, reps = a["n"], a["reps"]
+    grid = make_microgrid(n, seed=a["seed"])
+    qubo = build_qubo(grid)
+    land = energy_landscape(qubo)
+    opt = np.isclose(land, land.min())
+    exact = constrained_optimum(qubo).x
+    params = np.asarray(d["params"])
+    ideal = fast_qaoa_probs(ising_diagonal(qubo), n, params)
+    shots = next(iter(d["runs"].values()))["shots"]
+
+    dists = {"Ideal simulator": ideal}
+    if noise_model:
+        ansatz, _ = build_ansatz(qubo, reps)
+        circ = _bind(ansatz, params)
+        circ.measure_all()
+        fb = fake_backend()
+        res = noisy_sampler(fb, seed=seed).run([backend_pass_manager(fb, seed).run(circ)], shots=shots).result()
+        dists[f"Noise model ({fb.name})"] = counts_to_probs(res[0].data.meas.get_counts(), n)
+    for label, run in d["runs"].items():
+        dists[f"{d['backend']} · {label}"] = counts_to_probs(run["counts"], n)
+    dists["Random guessing"] = np.full(2**n, 2.0**-n)
+
+    rows = []
+    for name, p in dists.items():
+        po = float(p[opt].sum())
+        top = np.argsort(-p)[:256]
+        bits = ((top[:, None] >> np.arange(n)) & 1).astype(np.int8)
+        cand = np.array([repair(grid, b) for b in bits])
+        best = cand[np.argmin(dispatch_objective(grid, cand))]
+        rows.append({
+            "setting": name,
+            "kind": "hardware" if name.startswith(d["backend"]) else ("baseline" if "Random" in name else "simulator"),
+            "p_optimal": po,
+            "p_optimal_err": float(np.sqrt(po * (1 - po) / shots)) if "Random" not in name else 0.0,
+            "enrichment": po * p.size / opt.sum(),
+            "expected_energy": float(p @ land),
+            "fidelity_to_ideal": float(np.sum(np.sqrt(p * ideal)) ** 2),
+            "found_optimal": bool(np.array_equal(best, exact)),
+            "job_id": d["runs"][name.split(" · ")[1]]["job_id"] if " · " in name else "",
+        })
+    return {
+        "backend": d["backend"], "submitted_at": d.get("submitted_at", ""), "n": n, "reps": reps,
+        "seed": a["seed"], "shots": shots, "circuit": d["circuit"], "rows": rows,
+        "deficit_kw": grid.deficit, "optimal_dispatch": dispatch_metrics(grid, exact),
+        "optimal_providers": [int(i) for i in np.flatnonzero(exact)],
+        "probs": {k: v.tolist() for k, v in dists.items()}, "optimal_states": np.flatnonzero(opt).tolist(),
+    }

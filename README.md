@@ -215,7 +215,7 @@ python experiments/run_benchmarks.py --only density noise # selected experiments
 | Format | Command | Notes |
 |---|---|---|
 | Jupyter notebook | `jupyter notebook notebooks/demo.ipynb` | Choose kernel **Python (qff-gridq)**; *Run All* takes about 1 min |
-| Streamlit dashboard | `streamlit run app/streamlit_app.py` | Opens http://localhost:8501. Pick a village and an hour in the sidebar. Four tabs: **⚡ Demand & shortfall** (village demand forecast vs solar and wind, hourly shortfall) · **🔌 Providers** (capacity and price of each flexible provider) · **🧮 Dispatch & compare solvers** (run QAOA, exact, simulated annealing, greedy, greedy descent and random sampling side by side, with each solver's provider allocation, cost, gap to optimum, quality and runtime) · **📅 24-hour plan** (day cost vs diesel-first) |
+| Streamlit dashboard | `streamlit run app/streamlit_app.py` | Opens http://localhost:8501. Pick a village and an hour in the sidebar. Four tabs: **⚡ Demand & shortfall** (village demand forecast vs solar and wind, hourly shortfall) · **🔌 Providers** (capacity and price of each flexible provider) · **🧮 Dispatch & compare solvers** (run QAOA, exact, simulated annealing, greedy, greedy descent and random sampling side by side, with each solver's provider allocation, cost, gap to optimum, quality and runtime) · **🖥️ Real quantum hardware** (saved IBM Quantum runs vs ideal and noisy simulators, with job IDs; the pitch page) · **📅 24-hour plan** (day cost vs diesel-first). Below the solver comparison, the dispatch page has a separate **🖥️ Run QAOA on real IBM quantum hardware** section: angles are trained on the simulator, then one job is submitted to the QPU after you tick a confirmation box (needs `.env` credentials; uses credits). Its results get their own table and charts, next to the ideal and noisy simulators |
 
 ### 6.4 Real IBM Quantum hardware (optional; uses credits)
 
@@ -253,7 +253,7 @@ Results are saved to `results/hardware_<backend>_n<n>_p<reps>_s<seed>.json`. Eac
 | `QISKIT_IBM_TOKEN is empty` | Fill in `.env` (not `.env.example`) |
 | `No backend` / authentication error | Check the CRN matches the instance that owns the QPU; set `IBM_BACKEND` to a name listed on *Compute resources* |
 | Notebook can't find `gridq` | Select the **Python (qff-gridq)** kernel |
-| Streamlit shuts down with `segmentation fault` | Fixed: Qiskit's native code crashes inside the Streamlit server process on macOS, so the dashboard runs QAOA in a separate worker process (`app/qaoa_worker.py`). Pull the latest code. If a solve fails, the page now shows an error instead of exiting |
+| Streamlit shuts down with `segmentation fault` | Fixed: Qiskit's native code crashes inside the Streamlit server process on macOS, so the dashboard runs every Qiskit task in a separate worker process (`app/qaoa_worker.py`). Pull the latest code. If a solve fails, the page now shows an error instead of exiting |
 
 ## 7. Repository layout
 

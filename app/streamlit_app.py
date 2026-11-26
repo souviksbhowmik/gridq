@@ -6,7 +6,9 @@ Tabs:
   1. Demand & shortfall    village demand forecast vs solar + wind, hourly shortfall
   2. Providers             the flexible providers that can cover the shortfall
   3. Dispatch & compare    pick an hour, run several solvers, compare allocations
-  4. 24-hour plan          hour-by-hour dispatch, cost vs diesel-first
+                           (QAOA on ideal sim, noisy sim, or real IBM hardware)
+  4. Real quantum hardware saved IBM Quantum runs vs simulators (pitch page)
+  5. 24-hour plan          hour-by-hour dispatch, cost vs diesel-first
 """
 
 from __future__ import annotations
@@ -32,9 +34,28 @@ from gridq.metrics import naive_policy_cost
 from gridq.qubo import all_bitstrings, dispatch_objective
 
 try:  # run as `streamlit run app/streamlit_app.py`
-    from qaoa_worker import solve_qaoa_isolated
+    from qaoa_worker import (hardware_backend_isolated, score_saved_run_isolated, solve_hardware_isolated,
+                             solve_qaoa_isolated)
 except ImportError:  # imported as a module (tests)
-    from app.qaoa_worker import solve_qaoa_isolated
+    from app.qaoa_worker import (hardware_backend_isolated, score_saved_run_isolated, solve_hardware_isolated,
+                                 solve_qaoa_isolated)
+
+RESULTS = Path(__file__).resolve().parents[1] / "results"
+BACKENDS = ["Ideal simulator", "Noisy simulator (IBM Heron snapshot)"]
+
+
+def has_ibm_credentials() -> bool:
+    import os
+
+    from dotenv import dotenv_values
+
+    env = dotenv_values(Path(__file__).resolve().parents[1] / ".env")
+    return bool((env.get("QISKIT_IBM_TOKEN") or os.getenv("QISKIT_IBM_TOKEN") or "").strip())
+
+
+@st.cache_data(show_spinner=False)
+def scored_hardware_run(path: str, mtime: float) -> dict:
+    return score_saved_run_isolated(path)
 
 warnings.filterwarnings("ignore")
 st.set_page_config(page_title="GridQ: quantum microgrid dispatch", layout="wide")
@@ -151,8 +172,9 @@ row = bal.set_index("hour").loc[hour]
 grid = v.microgrid(hour)
 qubo = build_qubo(grid)
 
-tab_demand, tab_prov, tab_solve, tab_day = st.tabs(
-    ["⚡ Demand & shortfall", "🔌 Providers", "🧮 Dispatch & compare solvers", "📅 24-hour plan"])
+tab_demand, tab_prov, tab_solve, tab_hw, tab_day = st.tabs(
+    ["⚡ Demand & shortfall", "🔌 Providers", "🧮 Dispatch & compare solvers", "🖥️ Real quantum hardware",
+     "📅 24-hour plan"])
 
 # --------------------------------------------------------------------------- tab 1: demand & shortfall
 with tab_demand:
@@ -241,7 +263,7 @@ with tab_solve:
         q1, q2, q3 = st.columns(3)
         reps = q1.selectbox("QAOA layers p", [1, 2, 3, 4, 5], index=2)
         shots = q2.selectbox("Shots", [64, 128, 256, 512, 1024, 4096], index=2)
-        backend = q3.selectbox("QAOA backend", ["Ideal simulator", "Noisy simulator (IBM Heron snapshot)"])
+        backend = q3.selectbox("QAOA backend", BACKENDS)
 
     if st.button("Run solvers", type="primary", disabled=not chosen):
         results = {}
@@ -327,7 +349,7 @@ with tab_solve:
             q = results["QAOA (quantum)"]
             with st.expander("Quantum details: QAOA output distribution and circuit", expanded=False):
                 k1, k2, k3, k4 = st.columns(4)
-                k1.metric("Backend", "noisy" if cmp["backend"].startswith("Noisy") else "ideal")
+                k1.metric("Backend", "noisy sim" if cmp["backend"].startswith("Noisy") else "ideal sim")
                 k2.metric("Layers p / shots", f"{cmp['reps']} / {cmp['shots']}")
                 k3.metric("P(optimal) per shot", f"{q['p_optimal']:.3f}", f"random: {1 / 2 ** grid.n:.4f}",
                           delta_color="off")
@@ -350,6 +372,238 @@ with tab_solve:
                 "is small at this size. Any advantage would need much larger problems than today's hardware runs reliably.")
     else:
         st.info("Choose solvers and press **Run solvers**.")
+
+    # ------------------------------------------------------------------ real quantum hardware (separate)
+    st.divider()
+    st.subheader(f"🖥️ Run QAOA on real IBM quantum hardware ({hour:02d}:00)")
+    st.caption("Separate from the comparison above (which runs on simulators). QAOA angles are trained on the "
+               "simulator for free, then only the final circuit is sent to an IBM QPU. Results are shown below "
+               "next to the ideal and noisy simulators for the same problem. Note the IBM job id to look the job up "
+               "later on quantum.cloud.ibm.com.")
+    if not has_ibm_credentials():
+        st.warning("Needs IBM Quantum credentials: fill in `QISKIT_IBM_TOKEN` and `QISKIT_IBM_INSTANCE` in `.env` "
+                   "(see README §6.4). Saved runs are on the **🖥️ Real quantum hardware** tab.")
+    else:
+        h1, h2, h3, h4 = st.columns(4)
+        hw_reps = h1.selectbox("Layers p", [1, 2, 3], index=1, key="hw_reps",
+                               help="Keep p ≤ 2 on today's hardware: deeper circuits add more noise than signal.")
+        hw_shots = h2.selectbox("Shots", [1024, 2048, 4096], index=2, key="hw_shots")
+        hw_mit = h3.selectbox("Error mitigation", ["Off (recommended)", "DD + twirling"], key="hw_mit",
+                              help="Our measurements: DD + twirling lowered QAOA quality on ibm_fez and ibm_kingston.")
+        with h4:
+            st.write("")
+            if st.button("Check QPU and queue (free)"):
+                with st.spinner("Contacting IBM Quantum ..."):
+                    info = hardware_backend_isolated()
+                st.session_state["qpu_info"] = info
+        info = st.session_state.get("qpu_info")
+        if info:
+            if info["ok"]:
+                st.success(f"QPU **{info['backend']}** ({info['qubits']} qubits) · jobs waiting in queue: "
+                           f"**{info['pending_jobs']}** · operational: {info['operational']}")
+            else:
+                st.error(f"Could not reach IBM Quantum: {info['error']}")
+        ok = st.checkbox(f"I understand this submits one {hw_shots}-shot job to real IBM quantum hardware and "
+                         "uses credits. Queue time can be seconds to hours.", key="hw_ok")
+        if st.button("Run on real quantum hardware", type="primary", disabled=not ok):
+            with st.spinner("Training on the simulator, then waiting for the IBM queue and the QPU ..."):
+                t0 = time.perf_counter()
+                hwr = solve_hardware_isolated(grid, hw_reps, hw_shots, mitigate=hw_mit.startswith("DD"))
+                sim = solve_qaoa_isolated(grid, hw_reps, hw_shots, noisy=False) if hwr["ok"] else None
+                noi = solve_qaoa_isolated(grid, hw_reps, hw_shots, noisy=True) if hwr["ok"] else None
+            st.session_state["hw_live"] = {"key": (name, hour), "hw": hwr, "sim": sim, "noisy": noi,
+                                           "reps": hw_reps, "shots": hw_shots, "mit": hw_mit,
+                                           "total_s": time.perf_counter() - t0}
+
+    live = st.session_state.get("hw_live")
+    if live and live["key"] == (name, hour):
+        hwr = live["hw"]
+        if not hwr["ok"]:
+            st.error(f"Hardware run failed: {hwr['error']}")
+        else:
+            exact = constrained_optimum(qubo).x
+            best_cost = float(grid.cost @ exact)
+            st.success(f"Ran on **{hwr['backend']}** · IBM job `{hwr['job_id']}` · queue + run "
+                       f"{hwr['queue_and_run_s']:.0f} s · p = {live['reps']} · {live['shots']} shots · "
+                       f"mitigation: {live['mit']}")
+            runs = {"Real hardware (" + hwr["backend"] + ")": hwr, "Noisy simulator": live["noisy"],
+                    "Ideal simulator": live["sim"]}
+            runs = {k: r for k, r in runs.items() if r and r["ok"]}
+            xh = np.array(hwr["x"], dtype=np.int8)
+            a, b, c, d = st.columns(4)
+            hcost = float(grid.cost @ xh)
+            a.metric("Real hardware cost", f"₹{hcost:.0f}",
+                     "= exact optimum" if np.isclose(hcost, best_cost) else f"+₹{hcost - best_cost:.0f} vs optimum",
+                     delta_color="off" if np.isclose(hcost, best_cost) else "inverse")
+            b.metric("Real hardware vs random guess", f"{hwr['enrichment']:.2f}×")
+            if "Ideal simulator" in runs:
+                c.metric("Ideal simulator", f"{runs['Ideal simulator']['enrichment']:.2f}×",
+                         f"hardware keeps {100 * hwr['enrichment'] / runs['Ideal simulator']['enrichment']:.0f}%",
+                         delta_color="off")
+            d.metric("2-qubit depth on the QPU", hwr["two_q_depth"], f"{hwr['two_q_gates']} two-qubit gates",
+                     delta_color="off")
+
+            rows = []
+            for k, r in runs.items():
+                x = np.array(r["x"], dtype=np.int8)
+                m = dispatch_metrics(grid, x)
+                rows.append({"run": k, "providers on": ", ".join(str(i) for i in np.flatnonzero(x)),
+                             "supplied kW": m["supplied_kw"], "cost ₹": round(float(grid.cost @ x), 1),
+                             "optimal?": "✅" if np.array_equal(x, exact) else "❌",
+                             "P(optimal) per shot": round(r["p_optimal"], 4),
+                             "vs random guess ×": round(r["enrichment"], 2),
+                             "2-qubit depth": r["two_q_depth"], "IBM job id": r.get("job_id", "")})
+            st.markdown("**Real hardware vs simulators (same problem, same layers and shots)**")
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+            left, right = st.columns([2, 3])
+            with left:
+                fig, ax = plt.subplots(figsize=(5, 2.8))
+                names_ = list(runs) + ["Random guess"]
+                vals = [runs[k]["enrichment"] for k in runs] + [1.0]
+                cols = ["#d32f2f" if k.startswith("Real") else ("#9e9e9e" if k.startswith("Random") else "#7e57c2")
+                        for k in names_]
+                ax.barh(names_, vals, color=cols)
+                for i, val in enumerate(vals):
+                    ax.text(val + 0.05, i, f"{val:.2f}×", va="center", fontsize=8)
+                ax.invert_yaxis()
+                ax.set(xlabel="P(optimal) ÷ P(random guess)", title="Chance of the optimal dispatch")
+                ax.set_xlim(0, max(vals) * 1.3)
+                fig.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+            with right:
+                n = grid.n
+                ideal_counts = runs.get("Ideal simulator", hwr)["counts"]
+                order = sorted(ideal_counts, key=lambda k: -ideal_counts[k])[:16]
+                e_opt = qubo.energy(exact)
+                fig, ax = plt.subplots(figsize=(7.5, 2.8))
+                w = 0.8 / len(runs)
+                for j, (k, r) in enumerate(runs.items()):
+                    tot = sum(r["counts"].values())
+                    ax.bar(np.arange(len(order)) + j * w, [r["counts"].get(b, 0) / tot for b in order], w,
+                           label=k, color=["#d32f2f", "#7e57c2", "#b39ddb"][j % 3])
+                for i, b in enumerate(order):
+                    if np.isclose(qubo.energy(np.array([int(ch) for ch in reversed(b)])), e_opt):
+                        ax.axvspan(i - 0.1, i + 0.9, color="#c8e6c9", zorder=0)
+                ax.axhline(1 / 2 ** n, ls="--", c="grey", lw=1)
+                ax.set_xticks(np.arange(len(order)) + 0.4 - w / 2, order, rotation=90, fontsize=7)
+                ax.set(ylabel="share of shots", title="Output distribution (green band = optimal combination)")
+                ax.legend(fontsize=7)
+                fig.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+
+# --------------------------------------------------------------------------- tab 4: real quantum hardware
+with tab_hw:
+    st.subheader("Real IBM quantum hardware: does the quantum signal survive real noise?")
+    files = sorted(RESULTS.glob("hardware_*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+    current = [f for f in files if "_v1_" not in f.name]
+    if not files:
+        st.info("No hardware runs yet. Run `python experiments/run_hardware.py --n 6 --reps 2`.")
+    else:
+        labels = {f.name: f for f in current + [f for f in files if f not in current]}
+        pick = st.selectbox("Saved hardware run", list(labels),
+                            format_func=lambda k: k + ("   (earlier model version)" if "_v1_" in k else ""))
+        f = labels[pick]
+        with st.spinner("Scoring saved hardware counts against the simulators ..."):
+            hw = scored_hardware_run(str(f), f.stat().st_mtime)
+        if not hw["ok"]:
+            st.error(hw["error"])
+        else:
+            if "_v1_" in pick:
+                st.warning("This run used an earlier model version (with line limits). Its numbers here are "
+                           "re-scored against the current model; see README §4.5.")
+            rows = pd.DataFrame(hw["rows"])
+            ideal = rows[rows.setting == "Ideal simulator"].iloc[0]
+            unmit = rows[rows.setting.str.endswith("unmitigated")]
+            unmit = unmit.iloc[0] if len(unmit) else rows[rows.kind == "hardware"].iloc[0]
+            noise = rows[rows.setting.str.startswith("Noise model")]
+
+            a, b, c, d = st.columns(4)
+            a.metric("Quantum computer", hw["backend"], f"IBM Heron r2 · {hw['circuit']['num_qubits']} qubits",
+                     delta_color="off")
+            b.metric("Problem", f"{hw['n']} providers", f"shortfall {hw['deficit_kw']:.1f} kW · p = {hw['reps']}",
+                     delta_color="off")
+            c.metric("Real hardware vs random guess", f"{unmit.enrichment:.2f}×",
+                     f"{100 * unmit.enrichment / ideal.enrichment:.0f}% of ideal {ideal.enrichment:.2f}×",
+                     delta_color="off")
+            if len(noise):
+                d.metric("Noise model predicted", f"{noise.iloc[0].enrichment:.2f}×",
+                         f"real: {unmit.enrichment:.2f}×", delta_color="off")
+
+            left, right = st.columns([3, 2])
+            with left:
+                colours = {"simulator": "#7e57c2", "hardware": "#d32f2f", "baseline": "#9e9e9e"}
+                fig, ax = plt.subplots(figsize=(7, 3.6))
+                err = rows.p_optimal_err * 2 ** hw["n"] / len(hw["optimal_states"])
+                ax.barh(rows.setting, rows.enrichment, xerr=err, color=[colours[k] for k in rows.kind], capsize=3)
+                for i, r in rows.iterrows():
+                    ax.text(r.enrichment + err[i] + 0.06, i, f"{r.enrichment:.2f}×", va="center", fontsize=9)
+                ax.axvline(1, ls="--", c="grey", lw=1)
+                ax.invert_yaxis()
+                ax.set(xlabel="P(optimal dispatch) ÷ P(random guess)   (higher is better; error bar = ±1σ)",
+                       title="Chance of sampling the optimal dispatch")
+                ax.set_xlim(0, rows.enrichment.max() * 1.25)
+                fig.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+            with right:
+                st.markdown("**What this shows**")
+                lines = [
+                    f"- The **same trained QAOA circuit** was run on a perfect simulator, a simulator with real "
+                    f"IBM Heron noise, and the real **{hw['backend']}** quantum computer.",
+                    f"- On real hardware the circuit still finds the optimal dispatch **{unmit.enrichment:.1f}× more "
+                    f"often than random guessing**, which is {100 * unmit.enrichment / ideal.enrichment:.0f}% of the "
+                    f"noise-free result.",
+                ]
+                if len(noise):
+                    lines.append(f"- The noise model predicted **{noise.iloc[0].enrichment:.2f}×**; the real chip "
+                                 f"gave **{unmit.enrichment:.2f}×**. Our simulator is a trustworthy stand-in.")
+                mit = rows[rows.setting.str.endswith("· mitigated")]
+                if len(mit):
+                    lines.append(f"- **Error mitigation** (DD + twirling) *lowered* it to {mit.iloc[0].enrichment:.2f}×: "
+                                 "twirling flattens the output distribution, which hurts a sampling algorithm. "
+                                 "We measured it instead of assuming it helps.")
+                od = hw["optimal_dispatch"]
+                lines.append(f"- Every run decoded to the optimal dispatch: providers "
+                             f"**{', '.join(map(str, hw['optimal_providers']))}**, {od['supplied_kw']:.1f} kW for "
+                             f"**₹{od['cost_inr']:.1f}**, 100% of demand met.")
+                st.markdown("\n".join(lines))
+
+            table = rows.assign(
+                **{"P(optimal)": rows.p_optimal.round(4), "± 1σ": rows.p_optimal_err.round(4),
+                   "enrichment ×": rows.enrichment.round(2), "⟨H⟩ (lower = better)": rows.expected_energy.round(2),
+                   "fidelity to ideal": rows.fidelity_to_ideal.round(3),
+                   "optimal dispatch found": np.where(rows.found_optimal, "✅", "❌"), "IBM job id": rows.job_id},
+            )[["setting", "kind", "P(optimal)", "± 1σ", "enrichment ×", "⟨H⟩ (lower = better)", "fidelity to ideal",
+               "optimal dispatch found", "IBM job id"]]
+            st.dataframe(table, hide_index=True, width="stretch")
+
+            st.markdown("**Output distributions** (bar = share of shots; green = the optimal on/off combination)")
+            probs = hw["probs"]
+            show = [k for k in probs if not k.startswith("Random")]
+            top = np.argsort(-np.array(probs["Ideal simulator"]))[:16]
+            fig, axes = plt.subplots(1, len(show), figsize=(3.3 * len(show), 2.8), sharey=True)
+            for ax, k in zip(np.atleast_1d(axes), show):
+                p = np.array(probs[k])[top]
+                ax.bar(range(len(top)), p, color=["#2e7d32" if t in hw["optimal_states"] else "#90a4ae" for t in top])
+                ax.axhline(1 / 2 ** hw["n"], ls="--", c="grey", lw=1)
+                ax.set_title(k, fontsize=8)
+                ax.set_xticks([])
+            np.atleast_1d(axes)[0].set_ylabel("probability")
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+            st.caption(f"Submitted {hw['submitted_at']} · {hw['shots']} shots per run · transpiled circuit: "
+                       f"{hw['circuit']['two_qubit_gates']} two-qubit gates, two-qubit depth "
+                       f"{hw['circuit']['two_qubit_depth']} · file `results/{pick}`. Same 16 most likely combinations "
+                       "(by the ideal simulator) shown in every panel; dashed line = random guessing.")
+            if len(files) > 1:
+                with st.expander("All saved hardware runs"):
+                    st.dataframe(pd.DataFrame([{"file": x.name, "saved": time.strftime("%Y-%m-%d %H:%M",
+                                                time.localtime(x.stat().st_mtime))} for x in files]),
+                                 hide_index=True, width="stretch")
 
 # --------------------------------------------------------------------------- tab 4: 24-hour plan
 with tab_day:
