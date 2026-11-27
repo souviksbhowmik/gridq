@@ -67,6 +67,8 @@ For 6 providers and p = 2 that is 30 ZZ gates. Compiled for an IBM Heron chip, i
 
 It is also shown in the notebook (cell 4b) and the dashboard (dispatch page and hardware page).
 
+**Step-by-step explainer:** [docs/qubo_to_quantum.md](docs/qubo_to_quantum.md) walks through the translation dispatch problem → QUBO → Ising Hamiltonian → QAOA circuit → measurement → repair, with every number computed for the 6-provider case that ran on `ibm_kingston`.
+
 **Feasibility repair.** A squared penalty cannot encode `supply ≥ deficit` exactly. So **every solver's output, quantum or classical**, goes through the same repair step (`classical.repair`): add the cheapest-per-kW asset while short, then trim waste. This keeps the comparison like-for-like.
 
 ## 3. Methods
@@ -278,7 +280,7 @@ notebooks/        demo.ipynb
 app/              streamlit_app.py
 results/          CSVs + plots (+ hardware JSON with job IDs)
 tests/            test_gridq.py
-docs/             architecture.png
+docs/             architecture.png · qaoa_circuit_ibm_kingston.png · qubo_to_quantum.md (QUBO → quantum explainer)
 ```
 
 ## 8. Versions
